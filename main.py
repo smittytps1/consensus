@@ -1,149 +1,136 @@
-import json
 import os
-import pandas as pd
-from playwright.sync_api import sync_playwright
-from bs4 import BeautifulSoup
+import json
+import requests
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
+from playwright.sync_api import sync_playwright
+from google.oauth2.service_account import Credentials
+from google import genai
 
-# --- CONFIGURATION ---
-GOOGLE_SHEET_NAME = "MLB Consensus Picks"
-# Standardization dictionary (Sites use different abbreviations for teams)
-TEAM_MAP = {
-    "NYY": "New York Yankees", "Yankees": "New York Yankees",
-    "BOS": "Boston Red Sox", "Red Sox": "Boston Red Sox",
-    "LAD": "Los Angeles Dodgers", "Dodgers": "Los Angeles Dodgers",
-    # Add all 30 MLB teams here...
-}
-
-# --- SCRAPING FUNCTIONS ---
-
-def scrape_pickswise(page):
-    print("Scraping Pickswise...")
-    page.goto("https://www.pickswise.com/mlb/picks/", timeout=60000)
-    page.wait_for_selector(".event-card", timeout=15000) # Wait for elements to load
-    html = page.content()
-    soup = BeautifulSoup(html, 'html.parser')
+# --- 1. SCRAPE THE 5 PREDICTION SITES ---
+def scrape_prediction_sites():
+    sites = [
+        ("Pickswise", "https://www.pickswise.com/mlb/picks/"),
+        ("Winners & Whiners", "https://winnersandwhiners.com/free-picks/mlb"),
+        ("Ballpark Pal", "https://www.ballparkpal.com/"),
+        ("StatSalt", "https://statsalt.com/free-picks/mlb"),
+        ("OddsJam", "https://oddsjam.com/betting-tools/promo-converter")
+    ]
     
-    picks = []
-    # Replace '.event-card' and '.team-name' with actual current CSS classes
-    for card in soup.select('.event-card'):
-        try:
-            team = card.select_one('.predicted-winner').text.strip()
-            confidence = len(card.select('.star-rating-filled')) # Example of 1-3 star confidence
-            picks.append({"Team": TEAM_MAP.get(team, team), "Source": "Pickswise", "Confidence": confidence})
-        except:
-            continue
-    return picks
-
-def scrape_winners_and_whiners(page):
-    print("Scraping Winners & Whiners...")
-    page.goto("https://winnersandwhiners.com/free-picks/mlb", timeout=60000)
-    html = page.content()
-    soup = BeautifulSoup(html, 'html.parser')
+    scraped_text = ""
+    print("Launching Playwright to scrape prediction sites...")
     
-    picks = []
-    # Adjust selectors based on site inspection
-    for article in soup.select('.pick-article'):
-        try:
-            team = article.select_one('.pick-team').text.strip()
-            picks.append({"Team": TEAM_MAP.get(team, team), "Source": "WinnersWhiners", "Confidence": 1})
-        except:
-            continue
-    return picks
-
-def get_best_odds(team):
-    """
-    Ideally, use 'The-Odds-API' here instead of scraping 5 sportsbooks.
-    Scraping FanDuel/DraftKings directly usually results in an instant IP ban.
-    """
-    # Mock return - replace with actual Odds API call
-    return {"Sportsbook": "FanDuel", "Odds": "-110"}
-
-# --- ANALYSIS AND CONSENSUS ---
-
-def calculate_consensus(all_picks):
-    if not all_picks:
-        return pd.DataFrame()
-        
-    df = pd.DataFrame(all_picks)
-    
-    # Group by team and calculate consensus score
-    # Score = Number of sites picking them + total confidence points
-    consensus = df.groupby('Team').agg(
-        Mentions=('Source', 'count'),
-        Total_Confidence=('Confidence', 'sum'),
-        Sources=('Source', lambda x: ', '.join(x))
-    ).reset_index()
-    
-    consensus['Consensus_Score'] = consensus['Mentions'] + consensus['Total_Confidence']
-    
-    # Sort by highest score and get top 5
-    top_5 = consensus.sort_values(by='Consensus_Score', ascending=False).head(5)
-    
-    # Append best odds for the top 5
-    top_5['Best_Book'] = top_5['Team'].apply(lambda x: get_best_odds(x)['Sportsbook'])
-    top_5['Odds'] = top_5['Team'].apply(lambda x: get_best_odds(x)['Odds'])
-    top_5['Date'] = datetime.now().strftime("%Y-%m-%d")
-    
-    return top_5
-
-# --- GOOGLE SHEETS EXPORT ---
-
-def update_google_sheets(df):
-    print("Updating Google Sheets...")
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    
-    # Load credentials from GitHub Secrets (environment variable)
-    creds_json = os.environ.get("GCP_CREDENTIALS")
-    creds_dict = json.loads(creds_json)
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    
-    client = gspread.authorize(creds)
-    sheet = client.open(GOOGLE_SHEET_NAME).sheet1
-    
-    # Append data to sheet
-    for index, row in df.iterrows():
-        sheet.append_row(row.tolist())
-    print("Google Sheets updated successfully!")
-
-# --- MAIN EXECUTION ---
-
-def main():
-    all_picks = []
-    
-    # Use Playwright to handle Javascript-heavy sites
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        # Using a generic user agent helps prevent being blocked
+        # Using a standard user agent helps bypass basic bot protection
         context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
         page = context.new_page()
         
-        try:
-            all_picks.extend(scrape_pickswise(page))
-        except Exception as e:
-            print(f"Error scraping Pickswise: {e}")
-            
-        try:
-            all_picks.extend(scrape_winners_and_whiners(page))
-        except Exception as e:
-            print(f"Error scraping W&W: {e}")
-            
-        # Add BallparkPal and StatSalt calls here...
-        
+        for name, url in sites:
+            print(f"Reading {name}...")
+            try:
+                page.goto(url, timeout=45000)
+                page.wait_for_timeout(3000) # Allow Javascript predictions to fully load
+                
+                # Grab just the visible text, bypassing complicated HTML tags
+                text = page.locator("body").inner_text()
+                
+                # Take the first 6,000 characters to capture the main picks without overloading the AI context window
+                scraped_text += f"\n\n=== {name} ===\n{text[:6000]}"
+            except Exception as e:
+                print(f"Notice: Could not load {name}: {e}")
+                
         browser.close()
+    return scraped_text
+
+# --- 2. FETCH LIVE ODDS (ONLY APPROVED BOOKS) ---
+def fetch_live_odds(odds_key):
+    print("Fetching live odds for Caesars, FanDuel, BetMGM, and DraftKings...")
+    
+    # 'bookmakers' parameter filters specifically for the 4 sites you requested 
+    # (Note: Caesars uses 'williamhill_us' in The Odds API system)
+    url = f"https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/?apiKey={odds_key}&regions=us&markets=h2h,spreads,totals&bookmakers=draftkings,fanduel,betmgm,williamhill_us&oddsFormat=american"
+    
+    resp = requests.get(url)
+    if resp.status_code == 200:
+        return resp.json()
+    else:
+        print(f"Error fetching odds: {resp.status_code}")
+        return []
+
+# --- 3. GEMINI CONSENSUS SYNTHESIS ---
+def generate_consensus_picks(scraped_data, odds_data):
+    print("Sending site data and odds to Gemini for consensus evaluation...")
+    api_key = os.environ.get("GEMINI_API_KEY")
+    client = genai.Client(api_key=api_key)
+
+    prompt = f"""
+    You are an MLB betting consensus bot.
+    
+    === EXPERT PREDICTIONS FROM 5 SITES ===
+    {scraped_data}
+    
+    === LIVE SPORTSBOOK ODDS ===
+    {json.dumps(odds_data[:8])}
+    
+    INSTRUCTIONS:
+    1. Read the expert predictions from Pickswise, Winners & Whiners, Ballpark Pal, StatSalt, and OddsJam.
+    2. Identify which 5 bets have the highest consensus (agreement across the 5 sites).
+    3. Match those picks against the live odds data.
+    4. YOU MUST ONLY recommend bets where the odds are located on FanDuel, DraftKings, BetMGM, or Caesars.
+    5. Return strictly a JSON array of 5 objects containing:
+       "date", "game", "bet_type", "pick", "odds", "reasoning"
+       (For "bet_type", list the market and the sportsbook, e.g., "Moneyline (DraftKings)")
+    """
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt
+    )
+
+    # Clean the response to ensure it can be parsed as JSON
+    clean_json = response.text.replace("```json", "").replace("```", "").strip()
+    return json.loads(clean_json)
+
+# --- 4. EXPORT TO GOOGLE SHEETS ---
+def update_google_sheets(picks):
+    print("Connecting to Google Sheets...")
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    
+    # Using your existing GCP_SERVICE_ACCOUNT_JSON secret structure
+    creds_dict = json.loads(os.environ.get("GCP_SERVICE_ACCOUNT_JSON"))
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    
+    client = gspread.authorize(creds)
+    sheet = client.open("MLB Consensus Picks").sheet1
+    
+    # Write headers if the sheet is empty
+    if not sheet.get_all_values():
+        sheet.append_row(["Date", "Game", "Bet Type / Sportsbook", "Pick", "Odds", "Consensus Reasoning"])
         
-    print(f"Gathered {len(all_picks)} total picks.")
+    for p in picks:
+        sheet.append_row([
+            p.get("date", datetime.now().strftime("%Y-%m-%d")),
+            p.get("game", ""),
+            p.get("bet_type", ""),
+            p.get("pick", ""),
+            p.get("odds", ""),
+            p.get("reasoning", "")
+        ])
+    print("Successfully logged top 5 consensus picks to Google Sheets!")
+
+# --- MAIN EXECUTION ---
+def main():
+    odds_key = os.environ.get("ODDS_API_KEY")
     
-    # Calculate top 5
-    top_5_df = calculate_consensus(all_picks)
-    print("\n--- TOP 5 CONSENSUS PICKS ---")
-    print(top_5_df)
+    scraped_text = scrape_prediction_sites()
+    live_odds = fetch_live_odds(odds_key)
     
-    # Push to sheets
-    if not top_5_df.empty:
-        update_google_sheets(top_5_df)
+    if live_odds and scraped_text:
+        top_picks = generate_consensus_picks(scraped_text, live_odds)
+        update_google_sheets(top_picks)
+    else:
+        print("Pipeline failed: Missing odds or scraped data.")
 
 if __name__ == "__main__":
     main()

@@ -34,23 +34,32 @@ def get_sheet():
     return sheet
 
 def ensure_headers(sheet):
-    """Ensures row 1 contains bold, frozen headers."""
+    """Ensures row 1 contains bold, frozen column headers in the MLB tab."""
     try:
         existing_rows = sheet.get_all_values()
         headers = [
             "Date", "Pulled Time", "Game", "Bet Type / Sportsbook", "Pick", "Odds", 
             "Implied Prob (%)", "Model Prob (%)", "EV (%)", "Units", 
-            "Status", "P/L ($)", "Reasoning", "Consensus Breakdown"
+            "Status", "P/L ($)", "Reasoning", "Validation", "High Agreement & Source Breakdown", "Game Start Time"
         ]
 
-        if not existing_rows or existing_rows[0][0] != "Date":
-            print("Writing column headers to row 1...")
+        if len(existing_rows) == 0 or (len(existing_rows) > 0 and existing_rows[0][0] != "Date"):
+            print("Writing MLB column headers to row 1...")
             sheet.insert_row(headers, index=1)
             try:
-                sheet.format("A1:N1", {"textFormat": {"bold": True}})
+                sheet.format("A1:P1", {"textFormat": {"bold": True}})
                 sheet.freeze(rows=1)
             except Exception as e:
                 print(f"Header formatting notice: {e}")
+        else:
+            print("Headers already exist on the MLB tab. Checking for missing appended columns...")
+            current_row_len = len(existing_rows[0])
+            if current_row_len < 16 or "Game Start Time" not in existing_rows[0]:
+                sheet.update_cell(1, 16, "Game Start Time")
+                try:
+                    sheet.format("P1", {"textFormat": {"bold": True}})
+                except:
+                    pass
     except Exception as e:
         print(f"Notice while checking headers: {e}")
 
@@ -61,182 +70,96 @@ def scrape_prediction_sites():
         ("Winners & Whiners", "https://winnersandwhiners.com/free-picks/mlb"),
         ("Ballpark Pal", "https://www.ballparkpal.com/"),
         ("StatSalt", "https://statsalt.com/free-picks/mlb"),
-        ("OddsJam Promo Converter", "https://oddsjam.com/betting-tools/promo-converter")
+        ("OddsJam", "https://oddsjam.com/betting-tools/promo-converter")
     ]
     
     scraped_text = ""
-    print("Launching Playwright to scrape prediction sources...")
+    print("Launching Playwright to scrape prediction sites...")
     
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
+        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         page = context.new_page()
         
         for name, url in sites:
-            print(f"Fetching predictions from {name}...")
+            print(f"Reading {name}...")
             try:
                 page.goto(url, timeout=45000)
                 page.wait_for_timeout(3000)
                 text = page.locator("body").inner_text()
-                # Capture the core prediction text
-                scraped_text += f"\n\n=== SOURCE: {name} ===\n{text[:6000]}"
+                scraped_text += f"\n\n=== {name} ===\n{text[:6000]}"
             except Exception as e:
-                print(f"Notice: Could not scrape {name}: {e}")
+                print(f"Notice: Could not load {name}: {e}")
                 
         browser.close()
     return scraped_text
 
-# --- 3. FETCH LIVE ODDS (CAESARS, FANDUEL, BETMGM, DRAFTKINGS) ---
-def fetch_mlb_odds(odds_key):
-    print("Fetching live MLB lines for FanDuel, DraftKings, BetMGM, and Caesars...")
+# --- 3. FETCH LIVE ODDS (ONLY APPROVED BOOKS) ---
+def fetch_live_odds(odds_key):
+    print("Fetching live odds for Caesars, FanDuel, BetMGM, and DraftKings...")
     url = f"https://api.the-odds-api.com/v4/sports/baseball_mlb/odds/?apiKey={odds_key}&regions=us&markets=h2h,spreads,totals&bookmakers=draftkings,fanduel,betmgm,williamhill_us&oddsFormat=american"
-    
     resp = requests.get(url)
     if resp.status_code == 200:
-        data = resp.json()
-        print(f"Successfully retrieved live odds for {len(data)} games.")
-        return data
+        return resp.json()
     else:
         print(f"Error fetching odds: {resp.status_code}")
         return []
 
-# --- 4. MEMORY MANAGEMENT ---
-def load_memory():
-    if os.path.exists("bot_memory.json"):
+# --- 4. EXTRACT JSON FROM GEMINI ---
+def parse_json_from_response(response):
+    """Robust extractor for JSON responses from GenAI models."""
+    raw_text = ""
+    if hasattr(response, "text") and response.text:
+        raw_text = response.text
+    elif hasattr(response, "candidates") and response.candidates:
+        parts = response.candidates[0].content.parts
+        raw_text = "".join([p.text for p in parts if hasattr(p, "text") and p.text])
+
+    raw_text = raw_text.strip()
+    json_match = re.search(r'\[.*\]', raw_text, re.DOTALL)
+    if json_match:
         try:
-            with open("bot_memory.json", "r") as f:
-                return json.load(f)
+            return json.loads(json_match.group(0))
         except Exception:
             pass
-    return {
-        "total_bets": 0,
-        "wins": 0,
-        "losses": 0,
-        "win_rate": "0%",
-        "learnings": "Initial run. Maintain balanced consensus evaluation."
-    }
+        
+    marker = "`" * 3
+    clean_text = raw_text.replace(f"{marker}json", "").replace(marker, "").strip()
+    return json.loads(clean_text)
 
-# --- 5. SYNTHESIZE CONSENSUS & SELECT TOP 5 PICKS ---
-def generate_consensus_picks(scraped_intel, odds_data, memory):
-    print("Sending site intelligence and sportsbook lines to Gemini for consensus analysis...")
+# --- 5. GEMINI CONSENSUS SYNTHESIS ---
+def generate_consensus_picks(scraped_data, odds_data):
+    print("Sending site data and odds to Gemini for consensus evaluation...")
     api_key = os.environ.get("GEMINI_API_KEY")
     client = genai.Client(api_key=api_key)
 
     prompt = f"""
-    You are an MLB consensus betting analyst.
+    You are an MLB betting consensus bot.
     
-    === HISTORICAL BOT PERFORMANCE ===
-    {json.dumps(memory, indent=2)}
-
-    === LIVE EXPERT PREDICTIONS & SIMULATIONS (FROM 5 SITES) ===
-    {scraped_intel}
+    === EXPERT PREDICTIONS FROM 5 SITES ===
+    {scraped_data}
     
-    === LIVE SPORTSBOOK ODDS (APPROVED BOOKS ONLY) ===
-    {json.dumps(odds_data[:10], indent=2)}
+    === LIVE SPORTSBOOK ODDS ===
+    {json.dumps(odds_data[:8])}
     
-    CRITICAL MANDATES:
-    1. Read and cross-reference all predictions from Pickswise, Winners & Whiners, Ballpark Pal, StatSalt, and OddsJam.
-    2. Identify which 5 bets show the HIGHEST CONSENSUS (strongest multi-site agreement or +EV alignment).
-    3. Match these consensus picks against the live sportsbook odds.
-    4. STRICT SPORTSBOOK FILTER: Bets MUST ONLY be placed on FanDuel, DraftKings, BetMGM, or Caesars (williamhill_us).
-    5. Return strictly a valid JSON array of up to 5 objects containing:
-       - "date": "YYYY-MM-DD"
-       - "game": "Away Team @ Home Team"
-       - "bet_type": e.g., "Moneyline (FanDuel)", "Spread (DraftKings)", "Total Over (BetMGM)", or "Moneyline (Caesars)"
-       - "pick": "Team or Over/Under Selection"
-       - "odds": numeric odds (e.g. -115 or 120)
-       - "implied_prob": string percentage (e.g. "53.5%")
-       - "model_prob": string percentage (e.g. "59.0%")
-       - "expected_value": string percentage (e.g. "+10.3%")
-       - "units": 1.0
-       - "reasoning": "2-sentence breakdown of sabermetrics, pitching, and matchup edge"
-       - "consensus_breakdown": "Specific agreement summary (e.g. 'Yes: Pickswise, Ballpark Pal, and Winners & Whiners all agree on ML')"
+    INSTRUCTIONS:
+    1. Read the expert predictions from Pickswise, Winners & Whiners, Ballpark Pal, StatSalt, and OddsJam.
+    2. Identify which 5 bets have the highest consensus (agreement across the 5 sites).
+    3. Match those picks against the live odds data.
+    4. YOU MUST ONLY recommend bets where the odds are located on FanDuel, DraftKings, BetMGM, or Caesars (williamhill_us).
+    5. Return strictly a JSON array of 5 objects containing:
+       "date" (YYYY-MM-DD), "game", "bet_type", "pick", "odds", "implied_prob", "model_prob", "expected_value", "units" (default 1.0), "reasoning", "high_agreement" (e.g. Yes/No and Source Breakdown)
     """
 
-    for model_name in ["gemini-2.5-flash", "gemini-3.6-flash"]:
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt
-            )
-            raw_text = response.text.strip()
-            json_match = re.search(r'\[.*\]', raw_text, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group(0))
-            clean_text = raw_text.replace("```json", "").replace("```", "").strip()
-            return json.loads(clean_text)
-        except Exception as e:
-            print(f"Notice with model {model_name}: {e}")
-            time.sleep(3)
-
-    return []
-
-# --- 6. AUTO-GRADING VIA SCORES API ---
-def auto_grade_pending_bets(sheet, odds_key):
     try:
-        records = sheet.get_all_records()
-        if not records:
-            return
-
-        pending_rows = [i for i, r in enumerate(records) if str(r.get("Status", "")).upper() == "PENDING"]
-        if not pending_rows:
-            print("No pending MLB bets to grade.")
-            return
-
-        print(f"Checking final scores for {len(pending_rows)} pending bet(s)...")
-        scores_url = f"https://api.the-odds-api.com/v4/sports/baseball_mlb/scores/?apiKey={odds_key}&daysFrom=3"
-        resp = requests.get(scores_url)
-        if resp.status_code != 200:
-            return
-
-        scores_data = resp.json()
-        updates = []
-
-        for row_idx, r in enumerate(records, start=2):
-            if str(r.get("Status", "")).upper() != "PENDING":
-                continue
-
-            game_title = str(r.get("Game", ""))
-            pick_str = str(r.get("Pick", "")).strip().lower()
-            try: odds = float(r.get("Odds", -110))
-            except: odds = -110.0
-            try: units = float(r.get("Units", 1.0))
-            except: units = 1.0
-
-            for match in scores_data:
-                if not match.get("completed"):
-                    continue
-
-                home_team = match.get("home_team", "")
-                away_team = match.get("away_team", "")
-
-                if home_team in game_title or away_team in game_title:
-                    scores = match.get("scores")
-                    if not scores or len(scores) < 2:
-                        continue
-
-                    home_score = next((int(s["score"]) for s in scores if s["name"] == home_team), 0)
-                    away_score = next((int(s["score"]) for s in scores if s["name"] == away_team), 0)
-
-                    winner = home_team if home_score > away_score else away_team
-                    is_win = (pick_str in winner.lower() or winner.lower() in pick_str)
-                    status = "WIN" if is_win else "LOSS"
-
-                    profit = (100 / abs(odds)) * 100 * units if (is_win and odds < 0) else ((odds / 100) * 100 * units if is_win else -100.0 * units)
-
-                    updates.append({
-                        "range": f"K{row_idx}:L{row_idx}",
-                        "values": [[status, round(profit, 2)]]
-                    })
-                    break
-
-        if updates:
-            sheet.batch_update(updates)
-            print("Auto-graded finished bets successfully!")
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+        return parse_json_from_response(response)
     except Exception as e:
-        print(f"Auto-grading notice: {e}")
+        print(f"Error during Gemini generation: {e}")
+        return []
 
 # --- MAIN EXECUTION ---
 def main():
@@ -244,42 +167,43 @@ def main():
     ensure_headers(sheet)
 
     odds_key = os.environ.get("ODDS_API_KEY")
-    if odds_key:
-        auto_grade_pending_bets(sheet, odds_key)
+    scraped_text = scrape_prediction_sites()
+    live_odds = fetch_live_odds(odds_key)
+    
+    if live_odds and scraped_text:
+        picks = generate_consensus_picks(scraped_text, live_odds)
+        
+        if not picks:
+            print("No picks were generated by the AI.")
+            return
 
-    memory = load_memory()
-    scraped_intel = scrape_prediction_sites()
-    odds_data = fetch_mlb_odds(odds_key)
+        current_time_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S EDT")
+        today_date_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
-    if not odds_data or not scraped_intel:
-        print("Pipeline aborted: Missing live odds or scraped data.")
-        return
+        print(f"Successfully synthesized {len(picks)} consensus picks. Writing to Google Sheets...")
 
-    picks = generate_consensus_picks(scraped_intel, odds_data, memory)
-    current_time_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S EDT")
-    today_date_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
-
-    print(f"Successfully synthesized {len(picks)} consensus picks. Writing to Google Sheets...")
-
-    for p in picks:
-        sheet.append_row([
-            p.get("date", today_date_str),
-            current_time_str,
-            p.get("game", ""),
-            p.get("bet_type", ""),
-            p.get("pick", ""),
-            p.get("odds", -110),
-            p.get("implied_prob", ""),
-            p.get("model_prob", ""),
-            p.get("expected_value", ""),
-            p.get("units", 1.0),
-            "PENDING",
-            0.0,
-            p.get("reasoning", ""),
-            p.get("consensus_breakdown", "")
-        ])
-
-    print("Pipeline run finished successfully!")
+        for p in picks:
+            sheet.append_row([
+                p.get("date", today_date_str),
+                current_time_str,
+                p.get("game", ""),
+                p.get("bet_type", ""),
+                p.get("pick", ""),
+                p.get("odds", -110),
+                p.get("implied_prob", ""),
+                p.get("model_prob", ""),
+                p.get("expected_value", ""),
+                p.get("units", 1.0),
+                "PENDING",
+                0.0,
+                p.get("reasoning", ""),
+                "", # Validation
+                p.get("high_agreement", ""),
+                ""  # Game Start Time
+            ])
+        print("Successfully logged top 5 consensus picks to Google Sheets!")
+    else:
+        print("Pipeline failed: Missing odds or scraped data.")
 
 if __name__ == "__main__":
     main()

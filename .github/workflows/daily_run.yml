@@ -1,29 +1,34 @@
-name: MLB Consensus Bot Pipeline
+name: MLB Betting Bot Auto-Run
 
 on:
   schedule:
     - cron: '0 14 * * *' # Runs daily at 10:00 AM EDT (14:00 UTC)
-  workflow_dispatch:     # Enables the manual run button
+  workflow_dispatch:     # Enables the manual "Run workflow" button
 
 jobs:
-  run-pipeline:
+  run-bot:
     runs-on: ubuntu-latest
-    steps:
-      - name: Check out repo code
-        uses: actions/checkout@v4.2.2
+    permissions:
+      contents: write    # Grants permission to push updates
 
-      - name: Setup Python
-        uses: actions/setup-python@v5.4.0
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install playwright beautifulsoup4 pandas requests gspread google-genai
           playwright install chromium
 
-      - name: Run Betting Bot Script
+      - name: Run MLB Consensus Bot
         env:
-          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
         run: python main.py

@@ -1,0 +1,29 @@
+name: MLB Consensus Bot Pipeline
+
+on:
+  schedule:
+    - cron: '0 14 * * *' # Runs daily at 10:00 AM EDT (14:00 UTC)
+  workflow_dispatch:     # Enables the manual run button
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo code
+        uses: actions/checkout@v4.2.2
+
+      - name: Setup Python
+        uses: actions/setup-python@v5.4.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install chromium
+
+      - name: Run Betting Bot Script
+        env:
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+        run: python main.py

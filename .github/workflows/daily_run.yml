@@ -1,4 +1,4 @@
-name: MLB Consensus Bot Auto-Run
+name: MLB Consensus Betting Bot Auto-Run
 
 on:
   schedule:
@@ -7,13 +7,13 @@ on:
   workflow_dispatch: # Enables the manual "Run workflow" button
 
 jobs:
-  run-consensus-bot:
+  run-bot:
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repository code
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -24,12 +24,20 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install playwright beautifulsoup4 pandas requests gspread google-genai
+          pip install -r requirements.txt
           playwright install chromium
 
-      - name: Run Betting Bot Script
+      - name: Run MLB Consensus Bot
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
-        run: python main.py
+        run: python bot.py
+
+      - name: Commit and Push bot_memory.json
+        run: |
+          git config --global user.name 'MLB Bot Automator'
+          git config --global user.email 'action@github.com'
+          git add bot_memory.json || true
+          git commit -m "Automated bot memory update [skip ci]" || echo "No changes to commit"
+          git push || true

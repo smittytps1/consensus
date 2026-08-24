@@ -43,7 +43,8 @@ def ensure_headers(sheet):
             "Status", "P/L ($)", "Reasoning", "Validation", "High Agreement & Source Breakdown", "Game Start Time"
         ]
 
-        if len(existing_rows) == 0 or (len(existing_rows) > 0 and existing_rows[0][0] != "Date"):
+        # Check if sheet is empty or first row is missing headers
+        if not existing_rows or not existing_rows[0] or existing_rows[0][0] != "Date":
             print("Writing MLB column headers to row 1...")
             sheet.insert_row(headers, index=1)
             try:
@@ -52,14 +53,7 @@ def ensure_headers(sheet):
             except Exception as e:
                 print(f"Header formatting notice: {e}")
         else:
-            print("Headers already exist on the MLB tab. Checking for missing appended columns...")
-            current_row_len = len(existing_rows[0])
-            if current_row_len < 16 or "Game Start Time" not in existing_rows[0]:
-                sheet.update_cell(1, 16, "Game Start Time")
-                try:
-                    sheet.format("P1", {"textFormat": {"bold": True}})
-                except:
-                    pass
+            print("Headers already exist on the MLB tab.")
     except Exception as e:
         print(f"Notice while checking headers: {e}")
 
@@ -78,7 +72,9 @@ def scrape_prediction_sites():
     
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
         page = context.new_page()
         
         for name, url in sites:
@@ -107,7 +103,7 @@ def fetch_live_odds(odds_key):
 
 # --- 4. EXTRACT JSON FROM GEMINI ---
 def parse_json_from_response(response):
-    """Robust extractor for JSON responses from GenAI models."""
+    """Extracts JSON arrays from Gemini model output."""
     raw_text = ""
     if hasattr(response, "text") and response.text:
         raw_text = response.text
@@ -127,14 +123,13 @@ def parse_json_from_response(response):
     clean_text = raw_text.replace(f"{marker}json", "").replace(marker, "").strip()
     return json.loads(clean_text)
 
-# --- 5. GEMINI CONSENSUS SYNTHESIS ---
+# --- 5. GEMINI CONSENSUS SYNTHESIS (PRO 3.1 -> FLASH FALLBACKS) ---
 def generate_consensus_picks(scraped_data, odds_data):
-    print("Sending site data and odds to Gemini for consensus evaluation...")
     api_key = os.environ.get("GEMINI_API_KEY")
     client = genai.Client(api_key=api_key)
 
     prompt = f"""
-    You are an MLB betting consensus bot.
+    You are an MLB betting consensus and quantitative prediction engine.
     
     === EXPERT PREDICTIONS FROM 5 SITES ===
     {scraped_data}
@@ -143,23 +138,57 @@ def generate_consensus_picks(scraped_data, odds_data):
     {json.dumps(odds_data[:8])}
     
     INSTRUCTIONS:
-    1. Read the expert predictions from Pickswise, Winners & Whiners, Ballpark Pal, StatSalt, and OddsJam.
-    2. Identify which 5 bets have the highest consensus (agreement across the 5 sites).
-    3. Match those picks against the live odds data.
-    4. YOU MUST ONLY recommend bets where the odds are located on FanDuel, DraftKings, BetMGM, or Caesars (williamhill_us).
-    5. Return strictly a JSON array of 5 objects containing:
-       "date" (YYYY-MM-DD), "game", "bet_type", "pick", "odds", "implied_prob", "model_prob", "expected_value", "units" (default 1.0), "reasoning", "high_agreement" (e.g. Yes/No and Source Breakdown)
+    1. Read and cross-reference all predictions from Pickswise, Winners & Whiners, Ballpark Pal, StatSalt, and OddsJam.
+    2. Identify which 5 bets show the HIGHEST CONSENSUS (strong agreement across sites or verified positive EV).
+    3. Match these picks against the live sportsbook odds.
+    4. STRICT SPORTSBOOK CONSTRAINT: You MUST ONLY select lines located on FanDuel, DraftKings, BetMGM, or Caesars (williamhill_us).
+    5. Return ONLY a valid JSON array containing exactly up to 5 objects with these keys:
+       - "date": "YYYY-MM-DD"
+       - "game": "Away Team @ Home Team"
+       - "bet_type": e.g. "Moneyline (FanDuel)", "Spread (DraftKings)", "Total Over (BetMGM)", or "Moneyline (Caesars)"
+       - "pick": "Team or Over/Under selection"
+       - "odds": numeric American odds (e.g. -115 or 120)
+       - "implied_prob": string percentage (e.g. "53.5%")
+       - "model_prob": string percentage (e.g. "59.0%")
+       - "expected_value": string percentage (e.g. "+10.3%")
+       - "units": 1.0
+       - "reasoning": "2-sentence breakdown of why this bet has edge"
+       - "high_agreement": "Summary of consensus across the 5 sites (e.g., 'Yes: Pickswise, Ballpark Pal & StatSalt agree on ML')"
     """
 
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt
-        )
-        return parse_json_from_response(response)
-    except Exception as e:
-        print(f"Error during Gemini generation: {e}")
-        return []
+    # Primary: Pro 3.1 -> Fallbacks: 3.7-Flash -> 3.6-Flash -> 3.5-Flash
+    candidate_models = [
+        "gemini-3.1-pro-preview",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash"
+    ]
+
+    for model_name in candidate_models:
+        for attempt in range(2):
+            try:
+                print(f"Attempting consensus synthesis with model: {model_name} (Attempt {attempt + 1})...")
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
+                parsed = parse_json_from_response(response)
+                if parsed and isinstance(parsed, list):
+                    print(f"Success! Model {model_name} synthesized {len(parsed)} consensus pick(s).")
+                    return parsed
+            except errors.ClientError as e:
+                print(f"ClientError on {model_name}: {e}")
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                    time.sleep(5)
+                elif "404" in str(e):
+                    break
+                else:
+                    break
+            except Exception as e:
+                print(f"Notice on {model_name}: {e}")
+                break
+
+    return []
 
 # --- MAIN EXECUTION ---
 def main():
@@ -174,15 +203,17 @@ def main():
         picks = generate_consensus_picks(scraped_text, live_odds)
         
         if not picks:
-            print("No picks were generated by the AI.")
+            print("No picks were returned by the AI synthesis.")
             return
 
         current_time_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S EDT")
         today_date_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
-        print(f"Successfully synthesized {len(picks)} consensus picks. Writing to Google Sheets...")
+        print(f"Writing {len(picks)} pick(s) to Google Sheets...")
 
         for p in picks:
+            if not isinstance(p, dict):
+                continue
             sheet.append_row([
                 p.get("date", today_date_str),
                 current_time_str,
@@ -197,13 +228,14 @@ def main():
                 "PENDING",
                 0.0,
                 p.get("reasoning", ""),
-                "", # Validation
+                "NEW",
                 p.get("high_agreement", ""),
-                ""  # Game Start Time
-            ])
-        print("Successfully logged top 5 consensus picks to Google Sheets!")
+                ""
+            ], value_input_option="USER_ENTERED")
+            
+        print("Successfully logged top consensus picks to Google Sheets!")
     else:
-        print("Pipeline failed: Missing odds or scraped data.")
+        print("Pipeline aborted: Missing live odds or scraped site text.")
 
 if __name__ == "__main__":
     main()

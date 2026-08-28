@@ -47,6 +47,31 @@ def ensure_headers(sheet):
     except Exception as e:
         print(f"Notice while checking headers: {e}")
 
+def get_existing_today_bets(sheet, today_str):
+    """Checks how many bets are already pending for today to prevent double-dipping."""
+    try:
+        rows = sheet.get_all_values()
+        if len(rows) <= 1:
+            return [], set()
+        
+        headers = [h.strip() for h in rows[0]]
+        date_idx = headers.index("Date")
+        game_idx = headers.index("Game")
+        status_idx = headers.index("Status")
+
+        today_pending = []
+        today_games = set()
+        for r in rows[1:]:
+            if len(r) > max(date_idx, game_idx, status_idx):
+                if r[date_idx].strip() == today_str:
+                    today_games.add(r[game_idx].strip().lower())
+                    if r[status_idx].strip().upper() == "PENDING":
+                        today_pending.append(r)
+        return today_pending, today_games
+    except Exception as e:
+        print(f"Notice checking existing bets: {e}")
+        return [], set()
+
 def update_evolution_log(spreadsheet, memory, current_time_str):
     """Logs a live snapshot of learning reflections and adjustments to the Evolution tab."""
     try:
@@ -70,13 +95,13 @@ def update_evolution_log(spreadsheet, memory, current_time_str):
             memory.get("total_bets", 0),
             memory.get("win_rate", "0%"),
             memory.get("net_profit_dollars", 0.0),
-            memory.get("learnings_and_adjustments", "Maintain standard criteria.")
+            memory.get("learnings_and_adjustments", "Maintain strict chalk cap and market diversity.")
         ])
         print("Evolution & Learnings tab updated successfully!")
     except Exception as e:
         print(f"Notice while logging to Evolution tab: {e}")
 
-# --- 2. ACCURATE AUTO-GRADING ENGINE (MONEYLINES, SPREADS, & TOTALS) ---
+# --- 2. ACCURATE AUTO-GRADING ENGINE ---
 def auto_grade_pending_bets(sheet, odds_key):
     """Grades PENDING bets (Moneylines, Spreads/Run Lines, and Over/Under Totals) accurately."""
     try:
@@ -85,7 +110,6 @@ def auto_grade_pending_bets(sheet, odds_key):
             return
 
         headers = [h.strip() for h in rows[0]]
-        
         try:
             status_idx = headers.index("Status")
             game_idx = headers.index("Game")
@@ -95,7 +119,7 @@ def auto_grade_pending_bets(sheet, odds_key):
             odds_idx = headers.index("Odds")
             units_idx = headers.index("Units")
         except ValueError as e:
-            print(f"Auto-grading skipped: Missing required header column - {e}")
+            print(f"Auto-grading skipped: Missing header - {e}")
             return
 
         pending_rows = []
@@ -111,7 +135,6 @@ def auto_grade_pending_bets(sheet, odds_key):
         scores_url = f"https://api.the-odds-api.com/v4/sports/baseball_mlb/scores/?apiKey={odds_key}&daysFrom=3"
         resp = requests.get(scores_url)
         if resp.status_code != 200:
-            print(f"Could not fetch score data. Status code: {resp.status_code}")
             return
 
         scores_data = resp.json()
@@ -153,7 +176,7 @@ def auto_grade_pending_bets(sheet, odds_key):
                         try:
                             game_dt = datetime.fromisoformat(commence_time_str.replace("Z", "+00:00"))
                             if game_dt <= pulled_dt:
-                                continue # Safeguard against grading games that started before the pick was made
+                                continue
                         except Exception:
                             pass
 
@@ -220,8 +243,7 @@ def auto_grade_pending_bets(sheet, odds_key):
                     elif status == "PUSH":
                         profit = 0.0
 
-                    print(f"Graded Row {row_idx}: {game_title} [{pick_str}] (Score: {away_score}-{home_score}, Total: {total_score}) -> {status} (${round(profit, 2)})")
-
+                    print(f"Graded Row {row_idx}: {game_title} [{pick_str}] -> {status} (${round(profit, 2)})")
                     updates.append({
                         "range": f"K{row_idx}:L{row_idx}",
                         "values": [[status, round(profit, 2)]]
@@ -229,23 +251,21 @@ def auto_grade_pending_bets(sheet, odds_key):
                     break
 
         if updates:
-            print(f"Batch updating {len(updates)} row(s) in sheet...")
             sheet.batch_update(updates)
             print("Successfully auto-graded pending bets!")
-
     except Exception as e:
-        print(f"Auto-grading completed with notice: {e}")
+        print(f"Auto-grading notice: {e}")
 
 # --- 3. RECURSIVE MEMORY & LEARNING SYSTEM ---
 def load_memory():
     if os.path.exists("bot_memory.json"):
         try:
             with open("bot_memory.json", "r") as f: return json.load(f)
-        except: pass
+        except Exception: pass
     
     default_memory = {
         "total_bets": 0, "wins": 0, "losses": 0, "win_rate": "0%", "net_profit_dollars": 0.0,
-        "learnings_and_adjustments": "No historical data evaluated yet. Maintain balanced consensus evaluation."
+        "learnings_and_adjustments": "Avoid minus-money favorites steeper than -120. Prioritize Over/Under totals and plus-money run lines."
     }
     with open("bot_memory.json", "w") as f: json.dump(default_memory, f, indent=2)
     return default_memory
@@ -271,11 +291,11 @@ def update_memory_from_sheet(sheet, memory):
             memory["losses"] = losses
             memory["win_rate"] = f"{win_rate}%"
             memory["net_profit_dollars"] = round(net_pl, 2)
-
-            if win_rate < 50.0:
-                memory["learnings_and_adjustments"] = f"Win rate is {win_rate}% (<50%). Tighten consensus thresholds. Require higher agreement across scraping sites and avoid low-edge heavy favorites."
-            else:
-                memory["learnings_and_adjustments"] = f"Win rate is {win_rate}% (profitable). Maintain current multi-site consensus filtering criteria."
+            memory["learnings_and_adjustments"] = (
+                f"Historical record is {wins}-{losses} ({win_rate}%). "
+                "ENFORCE HARD GUARDRAILS: Strictly reject ML favorites steeper than -120. "
+                "Target Over/Under totals and underdogs/run lines with high quantitative simulation backing."
+            )
 
         with open("bot_memory.json", "w") as f: json.dump(memory, f, indent=2)
     except Exception as e:
@@ -303,7 +323,7 @@ def scrape_prediction_sites():
                 page.goto(url, timeout=45000)
                 page.wait_for_timeout(3000)
                 scraped_text += f"\n\n=== {name} ===\n{page.locator('body').inner_text()[:6000]}"
-            except: pass
+            except Exception: pass
         browser.close()
     return scraped_text
 
@@ -321,45 +341,45 @@ def parse_json_from_response(response):
     json_match = re.search(r'\[.*\]', raw_text.strip(), re.DOTALL)
     if json_match:
         try: return json.loads(json_match.group(0))
-        except: pass
+        except Exception: pass
     
     clean_text = raw_text.replace("```json", "").replace("```", "").strip()
     return json.loads(clean_text)
 
-# --- 5. AI CONSENSUS SYNTHESIS ---
-def generate_consensus_picks(scraped_data, odds_data, memory):
+# --- 5. AI CONSENSUS SYNTHESIS WITH STRICT GUARDRAILS ---
+def generate_consensus_picks(scraped_data, odds_data, memory, max_picks_needed=5):
     api_key = os.environ.get("GEMINI_API_KEY")
     client = genai.Client(api_key=api_key)
 
     prompt = f"""
-    You are an adaptive MLB betting consensus engine that learns from past performance.
+    You are an MLB quantitative consensus betting engine governed by strict risk management guardrails.
     
-    === YOUR HISTORICAL MEMORY & PERFORMANCE REFLECTION ===
+    === HISTORICAL PERFORMANCE MEMORY ===
     {json.dumps(memory, indent=2)}
     
-    === EXPERT PREDICTIONS FROM 5 SITES ===
+    === EXPERT PREDICTIONS & SIMULATIONS (FROM 5 SITES) ===
     {scraped_data}
     
-    === LIVE SPORTSBOOK ODDS ===
-    {json.dumps(odds_data[:8])}
+    === LIVE SPORTSBOOK ODDS (APPROVED BOOKS ONLY) ===
+    {json.dumps(odds_data[:12], indent=2)}
     
-    INSTRUCTIONS:
-    1. Read your historical memory. If your win rate is struggling, enforce stricter consensus agreement across the 5 sites before selecting a pick.
-    2. Cross-reference predictions from the 5 sites and identify the 5 bets with the highest consensus agreement.
-    3. Match these picks against the live sportsbook odds.
-    4. STRICT SPORTSBOOK CONSTRAINT: You MUST ONLY select lines located on FanDuel, DraftKings, BetMGM, or Caesars (williamhill_us).
-    5. Return ONLY a valid JSON array containing exactly up to 5 objects with these keys:
+    CRITICAL ALGORITHMIC MANDATES (MUST OBEY):
+    1. FAVORITE JUICE CEILING: STRICTLY FORBIDDEN to select any Moneyline favorite steeper than -120 (e.g., -125, -135, -145, -160 are BANNED on Moneyline). If a heavy favorite has strong consensus, you may ONLY select them on the -1.5 Run Line (for plus money), or pass entirely.
+    2. TARGET MARKET DIVERSITY: Aim for at least 2 Over/Under Totals and 1 Plus-Money Underdog/Run Line. Do not generate a card full of chalk moneylines.
+    3. PROBABILITY CALIBRATION: Model win probabilities must remain anchored to reality. For favorites, model probability must NOT exceed the sportsbook implied probability by more than 3.0%.
+    4. STRICT SPORTSBOOK CONSTRAINT: Bets MUST ONLY be located on FanDuel, DraftKings, BetMGM, or Caesars (williamhill_us).
+    5. Return ONLY a valid JSON array of up to {max_picks_needed} objects with these keys:
        - "date": "YYYY-MM-DD"
        - "game": "Away Team @ Home Team"
-       - "bet_type": e.g. "Moneyline (FanDuel)", "Spread (DraftKings)"
-       - "pick": "Team or Over/Under selection"
-       - "odds": numeric American odds (e.g. -115 or 120)
-       - "implied_prob": string percentage (e.g. "53.5%")
-       - "model_prob": string percentage (e.g. "59.0%")
-       - "expected_value": string percentage (e.g. "+10.3%")
+       - "bet_type": e.g. "Total Over (FanDuel)", "Run Line (Caesars)", "Moneyline (DraftKings)"
+       - "pick": "Selection string (e.g. 'Over 8.5', 'Guardians -1.5', 'Rays')"
+       - "odds": numeric American odds (e.g. -110, 115, -105)
+       - "implied_prob": string percentage (e.g. "52.4%")
+       - "model_prob": string percentage (e.g. "55.0%")
+       - "expected_value": string percentage (e.g. "+5.2%")
        - "units": 1.0
-       - "reasoning": "2-sentence breakdown of the consensus edge and how memory influenced the pick"
-       - "high_agreement": "Summary of consensus across the 5 sites (e.g., 'Yes: Pickswise, Ballpark Pal & StatSalt agree on ML')"
+       - "reasoning": "2-sentence breakdown explaining simulation support and value edge"
+       - "high_agreement": "Source breakdown across the 5 sites"
     """
 
     candidate_models = ["gemini-3.1-pro-preview", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
@@ -378,7 +398,7 @@ def generate_consensus_picks(scraped_data, odds_data, memory):
             except Exception as e: break
     return []
 
-# --- 6. MAIN EXECUTION ---
+# --- 6. MAIN EXECUTION PIPELINE ---
 def main():
     spreadsheet, sheet = get_sheets()
     ensure_headers(sheet)
@@ -392,30 +412,62 @@ def main():
     current_time_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S EDT")
     today_date_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
-    print(f"Memory Loaded | Total Bets: {updated_memory['total_bets']} | Win Rate: {updated_memory['win_rate']}")
+    # Check today's existing portfolio to enforce 5-bet daily cap and block duplicates
+    today_pending, today_games = get_existing_today_bets(sheet, today_date_str)
+    slots_remaining = max(0, 5 - len(today_pending))
+
+    print(f"Memory Loaded | Win Rate: {updated_memory['win_rate']} | Existing Pending Today: {len(today_pending)}")
+
+    if slots_remaining <= 0:
+        print(f"Daily card limit reached (5 pending bets already active for {today_date_str}). Skipping pick generation to prevent overexposure.")
+        update_evolution_log(spreadsheet, updated_memory, current_time_str)
+        return
 
     scraped_text = scrape_prediction_sites()
     live_odds = fetch_live_odds(odds_key)
     
     if live_odds and scraped_text:
-        picks = generate_consensus_picks(scraped_text, live_odds, updated_memory)
+        picks = generate_consensus_picks(scraped_text, live_odds, updated_memory, max_picks_needed=slots_remaining)
         
         if not picks:
-            print("No picks were returned by the AI synthesis.")
+            print("No picks passed the strict consensus & risk filters.")
             return
 
-        print(f"Writing {len(picks)} pick(s) to Google Sheets...")
+        added_count = 0
         for p in picks:
             if not isinstance(p, dict): continue
+            
+            game_name = p.get("game", "").strip()
+            # Anti-Double-Dipping Filter
+            if game_name.lower() in today_games:
+                print(f"Skipping duplicate bet on game already active today: {game_name}")
+                continue
+
+            try:
+                odds_val = float(p.get("odds", -110))
+            except (ValueError, TypeError):
+                odds_val = -110.0
+
+            # Python-level enforcement: reject ML steeper than -120
+            bet_type_str = p.get("bet_type", "").lower()
+            if "moneyline" in bet_type_str and odds_val < -120:
+                print(f"Python Guardrail: Dropped chalk Moneyline {p.get('pick')} at {odds_val} (exceeds -120 limit).")
+                continue
+
             sheet.append_row([
-                p.get("date", today_date_str), current_time_str, p.get("game", ""), p.get("bet_type", ""),
-                p.get("pick", ""), p.get("odds", -110), p.get("implied_prob", ""), p.get("model_prob", ""),
+                p.get("date", today_date_str), current_time_str, game_name, p.get("bet_type", ""),
+                p.get("pick", ""), odds_val, p.get("implied_prob", ""), p.get("model_prob", ""),
                 p.get("expected_value", ""), p.get("units", 1.0), "PENDING", 0.0, p.get("reasoning", ""),
                 "NEW", p.get("high_agreement", "")
             ], value_input_option="USER_ENTERED")
+            
+            today_games.add(game_name.lower())
+            added_count += 1
+            if added_count >= slots_remaining:
+                break
         
+        print(f"Successfully added {added_count} new high-consensus pick(s) to Google Sheets!")
         update_evolution_log(spreadsheet, updated_memory, current_time_str)
-        print("Successfully logged top consensus picks to Google Sheets!")
     else:
         print("Pipeline aborted: Missing live odds or scraped site text.")
 

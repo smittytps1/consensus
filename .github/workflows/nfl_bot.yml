@@ -1,0 +1,33 @@
+name: NFL Consensus Bot
+
+on:
+  schedule:
+    # Runs twice a week (e.g., Thursdays and Saturdays at 10:00 AM UTC) to catch key weekly lines
+    - cron: '0 10 * * 4,6'
+  workflow_dispatch:
+
+jobs:
+  run-nfl-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests gspread oauth2client playwright google-genai
+          playwright install chromium
+
+      - name: Run NFL Bot script
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python nfl_bot.py

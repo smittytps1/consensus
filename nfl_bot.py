@@ -73,7 +73,7 @@ def get_existing_nfl_bets(sheet, today_str):
         return [], set()
 
 def update_nfl_evolution_log(spreadsheet, memory, current_time_str):
-    """Logs snapshot reflections to the NFL Evolution & Learnings tab."""
+    """Logs snapshot reflections to the NFL Evolution & Learnings tab safely."""
     try:
         try:
             evo_sheet = spreadsheet.worksheet("NFL Evolution & Learnings")
@@ -103,7 +103,7 @@ def update_nfl_evolution_log(spreadsheet, memory, current_time_str):
 
 # --- 2. NFL AUTO-GRADING ENGINE ---
 def auto_grade_nfl_bets(sheet, odds_key):
-    """Grades pending NFL bets (Spreads, Totals, Moneylines) using official scores."""
+    """Grades pending NFL bets using official scores."""
     try:
         rows = sheet.get_all_values()
         if len(rows) <= 1:
@@ -185,7 +185,7 @@ def auto_grade_nfl_bets(sheet, odds_key):
                             else:
                                 status = "LOSS"
 
-                    # 2. SPREADS / RUN LINES
+                    # 2. SPREADS
                     elif "spread" in bet_type or re.search(r'[-+]\d+\.?\d*', pick_str):
                         spread_match = re.search(r'([-+]\s*\d+\.?\d*)', pick_str)
                         spread_val = float(spread_match.group(1).replace(" ", "")) if spread_match else 0.0

@@ -23,7 +23,7 @@ def get_nfl_sheets():
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     client = gspread.authorize(creds)
     
-    spreadsheet = client.open("MLB AI Betting Tracker") # Master sheet container
+    spreadsheet = client.open("MLB AI Betting Tracker")
     try:
         sheet = spreadsheet.worksheet("NFL")
     except Exception:
@@ -32,7 +32,6 @@ def get_nfl_sheets():
     return spreadsheet, sheet
 
 def ensure_nfl_headers(sheet):
-    """Ensures row 1 contains bold, frozen column headers in the NFL tab."""
     try:
         existing_rows = sheet.get_all_values()
         headers = [
@@ -48,37 +47,41 @@ def ensure_nfl_headers(sheet):
     except Exception as e:
         print(f"Notice while checking NFL headers: {e}")
 
-def get_existing_nfl_bets(sheet, today_str):
-    """Checks existing pending bets to enforce weekly caps and prevent duplicate exposure."""
+def get_pending_nfl_bets(sheet):
+    """Retrieves all active pending bets with their row indices for re-evaluation."""
     try:
         rows = sheet.get_all_values()
         if len(rows) <= 1:
-            return [], set()
+            return []
         
         headers = [h.strip() for h in rows[0]]
-        date_idx = headers.index("Date")
-        game_idx = headers.index("Game")
         status_idx = headers.index("Status")
+        game_idx = headers.index("Game")
+        bet_type_idx = headers.index("Bet Type / Sportsbook")
+        pick_idx = headers.index("Pick")
+        odds_idx = headers.index("Odds")
 
         pending = []
-        games = set()
-        for r in rows[1:]:
-            if len(r) > max(date_idx, game_idx, status_idx):
-                games.add(r[game_idx].strip().lower())
-                if r[status_idx].strip().upper() == "PENDING":
-                    pending.append(r)
-        return pending, games
+        for idx, r in enumerate(rows[1:], start=2):
+            if len(r) > status_idx and r[status_idx].strip().upper() == "PENDING":
+                pending.append({
+                    "row_index": idx,
+                    "date": r[0],
+                    "game": r[game_idx],
+                    "bet_type": r[bet_type_idx],
+                    "pick": r[pick_idx],
+                    "odds": r[odds_idx]
+                })
+        return pending
     except Exception as e:
-        print(f"Notice checking existing NFL bets: {e}")
-        return [], set()
+        print(f"Notice retrieving pending NFL bets: {e}")
+        return []
 
 def update_nfl_evolution_log(spreadsheet, memory, current_time_str):
-    """Logs snapshot reflections to the NFL Evolution & Learnings tab safely."""
     try:
         try:
             evo_sheet = spreadsheet.worksheet("NFL Evolution & Learnings")
         except Exception:
-            print("Creating 'NFL Evolution & Learnings' tab...")
             evo_sheet = spreadsheet.add_worksheet(title="NFL Evolution & Learnings", rows=100, cols=8)
 
         existing_rows = evo_sheet.get_all_values()
@@ -97,38 +100,30 @@ def update_nfl_evolution_log(spreadsheet, memory, current_time_str):
             memory.get("net_profit_dollars", 0.0),
             memory.get("learnings_and_adjustments", "Respect key numbers (3 & 7), enforce -120 juice cap.")
         ])
-        print("NFL Evolution tab updated successfully!")
     except Exception as e:
         print(f"Notice while logging to NFL Evolution tab: {e}")
 
 # --- 2. NFL AUTO-GRADING ENGINE ---
 def auto_grade_nfl_bets(sheet, odds_key):
-    """Grades pending NFL bets using official scores."""
     try:
         rows = sheet.get_all_values()
         if len(rows) <= 1:
             return
 
         headers = [h.strip() for h in rows[0]]
-        try:
-            status_idx = headers.index("Status")
-            game_idx = headers.index("Game")
-            bet_type_idx = headers.index("Bet Type / Sportsbook")
-            pick_idx = headers.index("Pick")
-            odds_idx = headers.index("Odds")
-            units_idx = headers.index("Units")
-        except ValueError as e:
-            print(f"NFL Auto-grading skipped: Missing header - {e}")
-            return
+        status_idx = headers.index("Status")
+        game_idx = headers.index("Game")
+        bet_type_idx = headers.index("Bet Type / Sportsbook")
+        pick_idx = headers.index("Pick")
+        odds_idx = headers.index("Odds")
+        units_idx = headers.index("Units")
 
         pending_rows = [(idx, r) for idx, r in enumerate(rows[1:], start=2) 
                         if len(r) > status_idx and str(r[status_idx]).strip().upper() == "PENDING"]
 
         if not pending_rows:
-            print("No pending NFL bets to grade.")
             return
 
-        print(f"Checking results for {len(pending_rows)} pending NFL bet(s)...")
         scores_url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores/?apiKey={odds_key}&daysFrom=5"
         resp = requests.get(scores_url)
         if resp.status_code != 200:
@@ -142,15 +137,11 @@ def auto_grade_nfl_bets(sheet, odds_key):
             bet_type = str(r[bet_type_idx]).strip().lower()
             pick_str = str(r[pick_idx]).strip()
             
-            try:
-                odds = float(r[odds_idx])
-            except (ValueError, TypeError):
-                odds = -110.0
+            try: odds = float(r[odds_idx])
+            except (ValueError, TypeError): odds = -110.0
 
-            try:
-                units = float(r[units_idx]) if len(r) > units_idx and r[units_idx] else 1.0
-            except (ValueError, TypeError):
-                units = 1.0
+            try: units = float(r[units_idx]) if len(r) > units_idx and r[units_idx] else 1.0
+            except (ValueError, TypeError): units = 1.0
 
             for match in scores_data:
                 if not match.get("completed"):
@@ -172,37 +163,24 @@ def auto_grade_nfl_bets(sheet, odds_key):
                     profit = 0.0
                     pick_lower = pick_str.lower()
 
-                    # 1. TOTALS (OVER / UNDER)
                     if "total" in bet_type or "over" in pick_lower or "under" in pick_lower:
                         num_match = re.search(r'[-+]?\d*\.?\d+', pick_str)
                         if num_match:
                             line = float(num_match.group(0))
                             is_over = "over" in pick_lower
-                            if total_score == line:
-                                status = "PUSH"
-                            elif (is_over and total_score > line) or (not is_over and total_score < line):
-                                status = "WIN"
-                            else:
-                                status = "LOSS"
-
-                    # 2. SPREADS
+                            if total_score == line: status = "PUSH"
+                            elif (is_over and total_score > line) or (not is_over and total_score < line): status = "WIN"
+                            else: status = "LOSS"
                     elif "spread" in bet_type or re.search(r'[-+]\d+\.?\d*', pick_str):
                         spread_match = re.search(r'([-+]\s*\d+\.?\d*)', pick_str)
                         spread_val = float(spread_match.group(1).replace(" ", "")) if spread_match else 0.0
-                        
                         is_home = home_team.lower() in pick_lower
                         p_score = home_score if is_home else away_score
                         o_score = away_score if is_home else home_score
-
                         diff = (p_score + spread_val) - o_score
-                        if diff == 0:
-                            status = "PUSH"
-                        elif diff > 0:
-                            status = "WIN"
-                        else:
-                            status = "LOSS"
-
-                    # 3. MONEYLINES
+                        if diff == 0: status = "PUSH"
+                        elif diff > 0: status = "WIN"
+                        else: status = "LOSS"
                     else:
                         winner = home_team if home_score > away_score else away_team
                         is_win = (pick_lower in winner.lower() or winner.lower() in pick_lower)
@@ -215,11 +193,7 @@ def auto_grade_nfl_bets(sheet, odds_key):
                     elif status == "PUSH":
                         profit = 0.0
 
-                    print(f"Graded NFL Row {row_idx}: {game_title} [{pick_str}] -> {status} (${round(profit, 2)})")
-                    updates.append({
-                        "range": f"K{row_idx}:L{row_idx}",
-                        "values": [[status, round(profit, 2)]]
-                    })
+                    updates.append({"range": f"K{row_idx}:L{row_idx}", "values": [[status, round(profit, 2)]]})
                     break
 
         if updates:
@@ -234,7 +208,6 @@ def load_nfl_memory():
         try:
             with open("nfl_bot_memory.json", "r") as f: return json.load(f)
         except Exception: pass
-    
     default_memory = {
         "total_bets": 0, "wins": 0, "losses": 0, "win_rate": "0%", "net_profit_dollars": 0.0,
         "learnings_and_adjustments": "Respect key football numbers (3 and 7). Avoid moneyline favorites steeper than -120."
@@ -246,30 +219,23 @@ def update_nfl_memory_from_sheet(sheet, memory):
     try:
         rows = sheet.get_all_values()
         if len(rows) <= 1: return memory
-
         headers = [h.strip() for h in rows[0]]
         status_idx, pl_idx = headers.index("Status"), headers.index("P/L ($)")
-
         wins = sum(1 for r in rows[1:] if len(r) > status_idx and str(r[status_idx]).strip().upper() == "WIN")
         losses = sum(1 for r in rows[1:] if len(r) > status_idx and str(r[status_idx]).strip().upper() == "LOSS")
         total = wins + losses
-
         if total > 0:
-            win_rate = round((wins / total) * 100, 1)
-            net_pl = sum(float(r[pl_idx] or 0.0) for r in rows[1:] if len(r) > pl_idx and r[pl_idx])
-
             memory["total_bets"] = total
             memory["wins"] = wins
             memory["losses"] = losses
-            memory["win_rate"] = f"{win_rate}%"
-            memory["net_profit_dollars"] = round(net_pl, 2)
-
+            memory["win_rate"] = f"{round((wins / total) * 100, 1)}%"
+            memory["net_profit_dollars"] = round(sum(float(r[pl_idx] or 0.0) for r in rows[1:] if len(r) > pl_idx and r[pl_idx]), 2)
         with open("nfl_bot_memory.json", "w") as f: json.dump(memory, f, indent=2)
     except Exception as e:
         print(f"NFL Memory update notice: {e}")
     return memory
 
-# --- 4. NFL SCRAPER & ODDS RETRIEVAL ---
+# --- 4. SCRAPING & ODDS ---
 def scrape_nfl_sites():
     sites = [
         ("NFL Pickwatch", "https://nflpickwatch.com/"),
@@ -279,13 +245,11 @@ def scrape_nfl_sites():
         ("Sharp Football Analysis", "https://www.sharpfootballanalysis.com/")
     ]
     scraped_text = ""
-    print("Launching Playwright to scrape NFL prediction & consensus sites...")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         page = context.new_page()
         for name, url in sites:
-            print(f"Reading {name}...")
             try:
                 page.goto(url, timeout=35000)
                 page.wait_for_timeout(3000)
@@ -300,71 +264,82 @@ def fetch_nfl_odds(odds_key):
     return resp.json() if resp.status_code == 200 else []
 
 def parse_json_from_response(response):
-    raw_text = ""
-    if hasattr(response, "text") and response.text: raw_text = response.text
-    elif hasattr(response, "candidates") and response.candidates:
+    raw_text = getattr(response, "text", "")
+    if hasattr(response, "candidates") and response.candidates:
         raw_text = "".join([p.text for p in response.candidates[0].content.parts if hasattr(p, "text") and p.text])
     
-    json_match = re.search(r'\[.*\]', raw_text.strip(), re.DOTALL)
+    json_match = re.search(r'\{.*\}', raw_text.strip(), re.DOTALL)
     if json_match:
         try: return json.loads(json_match.group(0))
         except Exception: pass
-    
-    clean_text = raw_text.replace("```json", "").replace("```", "").strip()
-    return json.loads(clean_text)
+    return {}
 
-# --- 5. AI CONSENSUS SYNTHESIS ---
-def generate_nfl_consensus_picks(scraped_data, odds_data, memory, max_picks_needed=5):
+# --- 5. RE-EVALUATION & PICK SYNTHESIS ---
+def evaluate_and_generate_nfl(scraped_data, odds_data, pending_bets, memory, slots_to_fill):
     api_key = os.environ.get("GEMINI_API_KEY")
     client = genai.Client(api_key=api_key)
 
     prompt = f"""
-    You are an elite NFL quantitative betting consensus engine focused on Point Spreads, Totals, and Key Numbers.
-    
+    You are an elite NFL quantitative betting consensus engine focused on Point Spreads, Totals, Key Numbers, and Injury Shifts.
+
     === HISTORICAL PERFORMANCE MEMORY ===
     {json.dumps(memory, indent=2)}
-    
-    === EXPERT PREDICTIONS & CONSENSUS (FROM 5 NFL SITES) ===
+
+    === ACTIVE PENDING PICKS TO RE-EVALUATE ===
+    {json.dumps(pending_bets, indent=2)}
+
+    === LATEST EXPERT PREDICTIONS & CONSENSUS (5 NFL SITES) ===
     {scraped_data}
-    
-    === LIVE SPORTSBOOK ODDS (NFL) ===
-    {json.dumps(odds_data[:12], indent=2)}
-    
-    CRITICAL ALGORITHMIC MANDATES (MUST OBEY):
-    1. JUICE CEILING: STRICTLY FORBIDDEN to select any Moneyline favorite steeper than -120. If a heavy favorite has strong backing, you must select their Point Spread (e.g., -3.5 or -7) or Totals instead.
-    2. KEY NUMBERS FOCUS: Prioritize NFL key numbers for spreads (3, 7, 4, 6, 10).
-    3. APPROVED BOOKS ONLY: Bets MUST be located on FanDuel, DraftKings, BetMGM, or Caesars (williamhill_us).
-    4. Return ONLY a valid JSON array of up to {max_picks_needed} objects with these keys:
-       - "date": "YYYY-MM-DD"
-       - "game": "Away Team @ Home Team"
-       - "bet_type": e.g. "Spread (DraftKings)", "Total Over (FanDuel)", "Moneyline (BetMGM)"
-       - "pick": "Selection string (e.g. 'Chiefs -3.5', 'Over 47.5')"
-       - "odds": numeric American odds (e.g. -110, 115)
-       - "implied_prob": string percentage
-       - "model_prob": string percentage
-       - "expected_value": string percentage
-       - "units": 1.0
-       - "reasoning": "2-sentence breakdown explaining efficiency metrics or consensus edge"
-       - "high_agreement": "Source breakdown across the 5 NFL sites"
+
+    === LATEST LIVE SPORTSBOOK ODDS (NFL) ===
+    {json.dumps(odds_data[:14], indent=2)}
+
+    MANDATES:
+    1. RE-EVALUATION: For every item in ACTIVE PENDING PICKS:
+       - Check if latest injury news, weather, or line movement invalidates the pick.
+       - If the pick still holds strong EV and consensus, action = "VALIDATED".
+       - If line movement crossed a key number in the wrong direction or major injuries arose, action = "REJECTED".
+    2. JUICE CEILING: No ML favorite steeper than -120.
+    3. SLOTS TO FILL: You may propose up to {slots_to_fill} new picks to fill vacant card spots.
+    4. RETURN JSON OBJECT STRICTLY WITH THIS STRUCTURE:
+       {{
+         "validations": [
+           {{
+             "row_index": <int>,
+             "action": "VALIDATED" or "REJECTED",
+             "note": "Reason for keeping or dropping"
+           }}
+         ],
+         "new_picks": [
+           {{
+             "date": "YYYY-MM-DD",
+             "game": "Away Team @ Home Team",
+             "bet_type": "Spread (DraftKings)",
+             "pick": "Team +/-X.X",
+             "odds": -110,
+             "implied_prob": "52.4%",
+             "model_prob": "57.5%",
+             "expected_value": "9.7%",
+             "units": 1.0,
+             "reasoning": "2 sentences explaining matchup and key number",
+             "high_agreement": "Source breakdown"
+           }}
+         ]
+       }}
     """
 
-    candidate_models = ["gemini-3.1-pro-preview", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
-    for model_name in candidate_models:
-        for attempt in range(2):
-            try:
-                print(f"Attempting NFL consensus synthesis with model: {model_name}...")
-                response = client.models.generate_content(model=model_name, contents=prompt)
-                parsed = parse_json_from_response(response)
-                if parsed and isinstance(parsed, list):
-                    return parsed
-            except errors.ClientError as e:
-                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e): time.sleep(5)
-                elif "404" in str(e): break
-                else: break
-            except Exception as e: break
-    return []
+    for model_name in ["gemini-3.1-pro-preview", "gemini-3.7-flash", "gemini-3.6-flash"]:
+        try:
+            print(f"Running NFL re-evaluation with {model_name}...")
+            response = client.models.generate_content(model=model_name, contents=prompt)
+            result = parse_json_from_response(response)
+            if result and ("validations" in result or "new_picks" in result):
+                return result
+        except Exception as e:
+            time.sleep(3)
+    return {"validations": [], "new_picks": []}
 
-# --- 6. MAIN EXECUTION PIPELINE ---
+# --- 6. MAIN PIPELINE ---
 def main():
     spreadsheet, sheet = get_nfl_sheets()
     ensure_nfl_headers(sheet)
@@ -378,61 +353,59 @@ def main():
     current_time_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S EDT")
     today_date_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
-    today_pending, today_games = get_existing_nfl_bets(sheet, today_date_str)
-    slots_remaining = max(0, 5 - len(today_pending))
+    pending_bets = get_pending_nfl_bets(sheet)
+    active_games = {p["game"].strip().lower() for p in pending_bets}
+    slots_to_fill = max(0, 5 - len(pending_bets))
 
-    print(f"NFL Memory Loaded | Win Rate: {updated_memory['win_rate']} | Existing Pending: {len(today_pending)}")
-
-    if slots_remaining <= 0:
-        print("Weekly NFL card limit reached (5 pending bets active). Skipping pick generation.")
-        update_nfl_evolution_log(spreadsheet, updated_memory, current_time_str)
-        return
+    print(f"Active Pending Bets: {len(pending_bets)} | Open Slots: {slots_to_fill}")
 
     scraped_text = scrape_nfl_sites()
     live_odds = fetch_nfl_odds(odds_key)
-    
-    if live_odds and scraped_text:
-        picks = generate_nfl_consensus_picks(scraped_text, live_odds, updated_memory, max_picks_needed=slots_remaining)
-        
-        if not picks:
-            print("No NFL picks passed the strict consensus & risk filters.")
-            return
 
-        added_count = 0
-        for p in picks:
-            if not isinstance(p, dict): continue
-            
-            game_name = p.get("game", "").strip()
-            if game_name.lower() in today_games:
-                print(f"Skipping duplicate NFL bet on game already active: {game_name}")
-                continue
+    if not live_odds or not scraped_text:
+        print("Missing live odds or scraped text. Exiting.")
+        return
 
-            try:
-                odds_val = float(p.get("odds", -110))
-            except (ValueError, TypeError):
-                odds_val = -110.0
+    result = evaluate_and_generate_nfl(scraped_text, live_odds, pending_bets, updated_memory, slots_to_fill)
 
-            bet_type_str = p.get("bet_type", "").lower()
-            if "moneyline" in bet_type_str and odds_val < -120:
-                print(f"Python Guardrail: Dropped NFL chalk Moneyline at {odds_val}.")
-                continue
+    # 1. Apply Validations to Column N (14)
+    validations = result.get("validations", [])
+    for v in validations:
+        row_idx = v.get("row_index")
+        action = str(v.get("action", "")).strip().upper()
+        if row_idx and action in ["VALIDATED", "REJECTED"]:
+            print(f"Row {row_idx}: Updating Validation to {action}")
+            sheet.update_cell(row_idx, 14, action)
+            if action == "REJECTED":
+                sheet.update_cell(row_idx, 11, "REJECTED")
+                slots_to_fill += 1
 
-            sheet.append_row([
-                p.get("date", today_date_str), current_time_str, game_name, p.get("bet_type", ""),
-                p.get("pick", ""), odds_val, p.get("implied_prob", ""), p.get("model_prob", ""),
-                p.get("expected_value", ""), p.get("units", 1.0), "PENDING", 0.0, p.get("reasoning", ""),
-                "NEW", p.get("high_agreement", "")
-            ], value_input_option="USER_ENTERED")
-            
-            today_games.add(game_name.lower())
-            added_count += 1
-            if added_count >= slots_remaining:
-                break
-        
-        print(f"Successfully added {added_count} new NFL consensus pick(s) to Google Sheets!")
-        update_nfl_evolution_log(spreadsheet, updated_memory, current_time_str)
-    else:
-        print("NFL Pipeline aborted: Missing live odds or scraped site text.")
+    # 2. Append New Picks for Available Slots
+    new_picks = result.get("new_picks", [])
+    added = 0
+    for p in new_picks:
+        if added >= slots_to_fill:
+            break
+        game_name = p.get("game", "").strip()
+        if game_name.lower() in active_games:
+            continue
+        try: odds_val = float(p.get("odds", -110))
+        except (ValueError, TypeError): odds_val = -110.0
+
+        if "moneyline" in p.get("bet_type", "").lower() and odds_val < -120:
+            continue
+
+        sheet.append_row([
+            p.get("date", today_date_str), current_time_str, game_name, p.get("bet_type", ""),
+            p.get("pick", ""), odds_val, p.get("implied_prob", ""), p.get("model_prob", ""),
+            p.get("expected_value", ""), p.get("units", 1.0), "PENDING", 0.0, p.get("reasoning", ""),
+            "NEW", p.get("high_agreement", "")
+        ], value_input_option="USER_ENTERED")
+        active_games.add(game_name.lower())
+        added += 1
+
+    print(f"Run completed: Validated {len(validations)} pick(s), appended {added} new pick(s).")
+    update_nfl_evolution_log(spreadsheet, updated_memory, current_time_str)
 
 if __name__ == "__main__":
     main()

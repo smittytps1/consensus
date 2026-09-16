@@ -70,30 +70,32 @@ def update_scoreboard(spreadsheet):
         print(f"Notice updating Scoreboard: {e}")
 
 # --- 3. BULLETPROOF AUTO-GRADING (ESPN REAL-TIME + THE ODDS API) ---
-def fetch_completed_nfl_scores(odds_key):
+def fetch_completed_nfl_scores(odds_key, pending_dates):
     completed_games = []
     
-    # 1. Primary: ESPN Scoreboard API (Real-time, instant post-game)
+    # 1. Primary: ESPN Scoreboard API (Targeting exact dates of your bets)
     try:
-        espn_url = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
-        resp = requests.get(espn_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        if resp.status_code == 200:
-            events = resp.json().get("events", [])
-            for ev in events:
-                status = ev.get("status", {}).get("type", {})
-                if status.get("completed", False):
-                    comp = ev.get("competitions", [{}])[0]
-                    teams = comp.get("competitors", [])
-                    if len(teams) >= 2:
-                        h_team = next((t for t in teams if t.get("homeAway") == "home"), None)
-                        a_team = next((t for t in teams if t.get("homeAway") == "away"), None)
-                        if h_team and a_team:
-                            completed_games.append({
-                                "home_team": h_team.get("team", {}).get("displayName", ""),
-                                "away_team": a_team.get("team", {}).get("displayName", ""),
-                                "home_score": int(h_team.get("score", 0)),
-                                "away_score": int(a_team.get("score", 0))
-                            })
+        for p_date in pending_dates:
+            formatted_date = p_date.replace("-", "") # Convert YYYY-MM-DD to YYYYMMDD for ESPN
+            espn_url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?dates={formatted_date}"
+            resp = requests.get(espn_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            if resp.status_code == 200:
+                events = resp.json().get("events", [])
+                for ev in events:
+                    status = ev.get("status", {}).get("type", {})
+                    if status.get("completed", False):
+                        comp = ev.get("competitions", [{}])[0]
+                        teams = comp.get("competitors", [])
+                        if len(teams) >= 2:
+                            h_team = next((t for t in teams if t.get("homeAway") == "home"), None)
+                            a_team = next((t for t in teams if t.get("homeAway") == "away"), None)
+                            if h_team and a_team:
+                                completed_games.append({
+                                    "home_team": h_team.get("team", {}).get("displayName", ""),
+                                    "away_team": a_team.get("team", {}).get("displayName", ""),
+                                    "home_score": int(h_team.get("score", 0)),
+                                    "away_score": int(a_team.get("score", 0))
+                                })
     except Exception as e:
         print(f"Notice fetching ESPN scores: {e}")
 
@@ -129,6 +131,7 @@ def auto_grade_nfl_bets(sheet, odds_key):
             return
 
         headers = [h.strip() for h in rows[0]]
+        date_idx = headers.index("Date")
         status_idx = headers.index("Status")
         game_idx = headers.index("Game")
         bet_type_idx = headers.index("Bet Type / Sportsbook")
@@ -142,8 +145,11 @@ def auto_grade_nfl_bets(sheet, odds_key):
         if not pending_rows:
             print("No pending NFL bets to grade.")
             return
+            
+        # Extract the unique dates from your pending bets
+        pending_dates = list(set([r[date_idx].strip() for _, r in pending_rows if len(r) > date_idx]))
 
-        completed_games = fetch_completed_nfl_scores(odds_key)
+        completed_games = fetch_completed_nfl_scores(odds_key, pending_dates)
         if not completed_games:
             print("No completed NFL games retrieved yet.")
             return
@@ -231,7 +237,6 @@ def update_nfl_evolution_log(spreadsheet, memory, current_time_str):
         existing_rows = evo_sheet.get_all_values()
         headers = ["Timestamp", "Sport", "Total Bets Evaluated", "Win Rate (%)", "Net Profit ($)", "Active Strategy Adjustment"]
 
-        # Safe header check to prevent IndexError
         if not existing_rows or not existing_rows[0] or len(existing_rows[0]) == 0 or existing_rows[0][0] != "Timestamp":
             evo_sheet.insert_row(headers, index=1)
             evo_sheet.format("A1:F1", {"textFormat": {"bold": True}})

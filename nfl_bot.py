@@ -146,7 +146,6 @@ def auto_grade_nfl_bets(sheet, odds_key):
             print("No pending NFL bets to grade.")
             return 0
             
-        # Extract the unique dates from your pending bets
         pending_dates = list(set([r[date_idx].strip() for _, r in pending_rows if len(r) > date_idx]))
         
         print(f"Checking results for {len(pending_rows)} pending NFL bet(s)...")
@@ -156,7 +155,7 @@ def auto_grade_nfl_bets(sheet, odds_key):
             print("No completed NFL games retrieved yet.")
             return 0
 
-        updates = []
+        updates_made = 0
         for row_idx, r in pending_rows:
             game_title = str(r[game_idx]).strip().lower()
             bet_type = str(r[bet_type_idx]).strip().lower()
@@ -181,7 +180,6 @@ def auto_grade_nfl_bets(sheet, odds_key):
                     status = None
                     profit = 0.0
 
-                    # 1. TOTALS
                     if "total" in bet_type or "over" in pick_lower or "under" in pick_lower:
                         num_match = re.search(r'[-+]?\d*\.?\d+', pick_str)
                         if num_match:
@@ -190,8 +188,6 @@ def auto_grade_nfl_bets(sheet, odds_key):
                             if total_score == line: status = "PUSH"
                             elif (is_over and total_score > line) or (not is_over and total_score < line): status = "WIN"
                             else: status = "LOSS"
-
-                    # 2. SPREADS
                     elif "spread" in bet_type or re.search(r'[-+]\d+\.?\d*', pick_str):
                         spread_match = re.search(r'([-+]\s*\d+\.?\d*)', pick_str) or re.search(r'([-+]\s*\d+\.?\d*)', bet_type)
                         spread_val = float(spread_match.group(1).replace(" ", "")) if spread_match else 0.0
@@ -204,8 +200,6 @@ def auto_grade_nfl_bets(sheet, odds_key):
                         if diff == 0: status = "PUSH"
                         elif diff > 0: status = "WIN"
                         else: status = "LOSS"
-
-                    # 3. MONEYLINES
                     else:
                         winner = home_team if home_score > away_score else away_team
                         is_win = (winner in pick_lower or pick_lower in winner)
@@ -219,13 +213,18 @@ def auto_grade_nfl_bets(sheet, odds_key):
                         profit = 0.0
 
                     print(f"Graded NFL Row {row_idx}: {r[game_idx]} [{pick_str}] -> {status} (${round(profit, 2)})")
-                    updates.append({"range": f"K{row_idx}:L{row_idx}", "values": [[status, round(profit, 2)]]})
+                    
+                    # Direct cell updates to prevent silent batch failures
+                    sheet.update_cell(row_idx, 11, status)
+                    sheet.update_cell(row_idx, 12, round(profit, 2))
+                    updates_made += 1
+                    
+                    time.sleep(1.5)
                     break
 
-        if updates:
-            sheet.batch_update(updates)
-            print(f"Successfully auto-graded {len(updates)} completed NFL bet(s)!")
-            return len(updates)
+        if updates_made > 0:
+            print(f"Successfully wrote {updates_made} completed NFL bet(s) to the sheet!")
+        return updates_made
             
     except Exception as e:
         print(f"NFL Auto-grading notice: {e}")

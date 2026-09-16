@@ -47,7 +47,6 @@ def ensure_nfl_headers(sheet):
 
 # --- 2. DYNAMIC SCOREBOARD TAB ---
 def update_scoreboard(spreadsheet):
-    """Creates or updates the Scoreboard tab with live formulas for MLB and NFL."""
     try:
         try:
             sb_sheet = spreadsheet.worksheet("Scoreboard")
@@ -69,14 +68,76 @@ def update_scoreboard(spreadsheet):
     except Exception as e:
         print(f"Notice updating Scoreboard: {e}")
 
-# --- 3. THE REBUILT REGULAR SEASON MATRIX GRADER ---
-def auto_grade_nfl_bets(sheet):
+# --- 3. BRAND NEW GRADER (TheSportsDB + Date Guardrails) ---
+def fetch_completed_nfl_scores(odds_key):
+    completed_games = []
+    
+    # 1. Primary: TheSportsDB (Free Global Sports API)
+    # Exclusively pulls regular season games for the current year
+    try:
+        current_year = datetime.now(ZoneInfo("America/New_York")).year
+        sportsdb_url = f"https://www.thesportsdb.com/api/v1/json/3/eventsseason.php?id=4391&s={current_year}"
+        resp = requests.get(sportsdb_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        
+        if resp.status_code == 200:
+            events = resp.json().get("events", [])
+            for ev in events:
+                status = ev.get("strStatus", "").lower()
+                if status in ["match finished", "finished"]:
+                    h_team = ev.get("strHomeTeam", "").lower()
+                    a_team = ev.get("strAwayTeam", "").lower()
+                    h_score = ev.get("intHomeScore")
+                    a_score = ev.get("intAwayScore")
+                    game_date = ev.get("dateEvent", "")
+                    
+                    if h_score is not None and a_score is not None:
+                        completed_games.append({
+                            "home_team": h_team,
+                            "away_team": a_team,
+                            "home_score": int(h_score),
+                            "away_score": int(a_score),
+                            "game_date": game_date
+                        })
+    except Exception as e:
+        print(f"Notice fetching TheSportsDB: {e}")
+
+    # 2. Secondary: The Odds API (Fallback capped at 3 days)
+    if odds_key:
+        try:
+            scores_url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores/?apiKey={odds_key}&daysFrom=3"
+            resp = requests.get(scores_url, timeout=10)
+            if resp.status_code == 200:
+                for match in resp.json():
+                    if match.get("completed"):
+                        h_team = match.get("home_team", "").lower()
+                        a_team = match.get("away_team", "").lower()
+                        scores = match.get("scores")
+                        game_date = match.get("commence_time", "")[:10]
+                        
+                        if scores and len(scores) >= 2:
+                            h_score = next((int(s["score"]) for s in scores if s["name"].lower() == h_team), 0)
+                            a_score = next((int(s["score"]) for s in scores if s["name"].lower() == a_team), 0)
+                            
+                            completed_games.append({
+                                "home_team": h_team,
+                                "away_team": a_team,
+                                "home_score": h_score,
+                                "away_score": a_score,
+                                "game_date": game_date
+                            })
+        except Exception as e:
+            print(f"Notice fetching The Odds API: {e}")
+
+    return completed_games
+
+def auto_grade_nfl_bets(sheet, odds_key):
     try:
         rows = sheet.get_all_values()
         if len(rows) <= 1:
             return 0
             
         headers = [h.strip() for h in rows[0]]
+        date_idx = headers.index("Date")
         status_idx = headers.index("Status")
         game_idx = headers.index("Game")
         bet_type_idx = headers.index("Bet Type / Sportsbook")
@@ -91,109 +152,96 @@ def auto_grade_nfl_bets(sheet):
             print("No pending NFL bets to grade.")
             return 0
             
-        print(f"Rebuilt Grader: Scanning entire NFL Regular Season matrix for {len(pending_rows)} pending bet(s)...")
+        print(f"Checking results for {len(pending_rows)} pending NFL bet(s)...")
+        completed_games = fetch_completed_nfl_scores(odds_key)
         
-        # Scrape all 18 weeks of the Regular Season to find absolute completed scores
-        completed_games = {} 
-        headers_req = {"User-Agent": "Mozilla/5.0"}
-        
-        for week in range(1, 19):
-            url = f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?seasontype=2&week={week}"
-            try:
-                resp = requests.get(url, headers=headers_req, timeout=5)
-                if resp.status_code == 200:
-                    for ev in resp.json().get("events", []):
-                        if ev.get("status", {}).get("type", {}).get("completed", False):
-                            comp = ev.get("competitions", [{}])[0]
-                            teams = comp.get("competitors", [])
-                            if len(teams) >= 2:
-                                h_team = next((t for t in teams if t.get("homeAway") == "home"), None)
-                                a_team = next((t for t in teams if t.get("homeAway") == "away"), None)
-                                if h_team and a_team:
-                                    ht_name = h_team.get("team", {}).get("displayName", "").lower()
-                                    at_name = a_team.get("team", {}).get("displayName", "").lower()
-                                    
-                                    # Saves the most recent completed matchup between these teams
-                                    completed_games[f"{at_name} @ {ht_name}"] = {
-                                        "home_team": ht_name,
-                                        "away_team": at_name,
-                                        "home_score": int(h_team.get("score", 0)),
-                                        "away_score": int(a_team.get("score", 0))
-                                    }
-            except Exception:
-                pass
+        if not completed_games:
+            print("No completed NFL games retrieved from APIs.")
+            return 0
 
         updates_made = 0
         for row_idx, r in pending_rows:
+            sheet_date = str(r[date_idx]).strip()
             game_title = str(r[game_idx]).strip().lower()
             bet_type = str(r[bet_type_idx]).strip().lower()
             pick_str = str(r[pick_idx]).strip()
             pick_lower = pick_str.lower()
             
             try: odds = float(r[odds_idx])
-            except: odds = -110.0
+            except (ValueError, TypeError): odds = -110.0
 
             try: units = float(r[units_idx]) if len(r) > units_idx and r[units_idx] else 1.0
-            except: units = 1.0
+            except (ValueError, TypeError): units = 1.0
 
-            # Match strict team names, completely ignoring the broken year/date math
-            match = None
-            for key, game_data in completed_games.items():
-                if game_data["home_team"] in game_title and game_data["away_team"] in game_title:
-                    match = game_data
-                    break
-            
-            if match:
-                home_score = match["home_score"]
-                away_score = match["away_score"]
-                total_score = home_score + away_score
-                status = None
-                profit = 0.0
+            for match in completed_games:
+                home_team = match["home_team"]
+                away_team = match["away_team"]
+                api_game_date = match.get("game_date", "")
 
-                if "total" in bet_type or "over" in pick_lower or "under" in pick_lower:
-                    num_match = re.search(r'[-+]?\d*\.?\d+', pick_str)
-                    if num_match:
-                        line = float(num_match.group(0))
-                        is_over = "over" in pick_lower
-                        if total_score == line: status = "PUSH"
-                        elif (is_over and total_score > line) or (not is_over and total_score < line): status = "WIN"
+                if home_team in game_title and away_team in game_title:
+                    
+                    # DATE GUARDRAIL: Physically blocks preseason games and multi-week division crossovers
+                    try:
+                        if not api_game_date:
+                            continue
+                        sheet_dt = datetime.strptime(sheet_date, "%Y-%m-%d")
+                        api_dt = datetime.strptime(api_game_date, "%Y-%m-%d")
+                        if abs((sheet_dt - api_dt).days) > 4:
+                            continue
+                    except Exception:
+                        continue 
+
+                    home_score = match["home_score"]
+                    away_score = match["away_score"]
+                    total_score = home_score + away_score
+
+                    status = None
+                    profit = 0.0
+
+                    if "total" in bet_type or "over" in pick_lower or "under" in pick_lower:
+                        num_match = re.search(r'[-+]?\d*\.?\d+', pick_str)
+                        if num_match:
+                            line = float(num_match.group(0))
+                            is_over = "over" in pick_lower
+                            if total_score == line: status = "PUSH"
+                            elif (is_over and total_score > line) or (not is_over and total_score < line): status = "WIN"
+                            else: status = "LOSS"
+                    
+                    elif "spread" in bet_type or re.search(r'[-+]\d+\.?\d*', pick_str):
+                        spread_match = re.search(r'([-+]\s*\d+\.?\d*)', pick_str) or re.search(r'([-+]\s*\d+\.?\d*)', bet_type)
+                        spread_val = float(spread_match.group(1).replace(" ", "")) if spread_match else 0.0
+                        
+                        is_home_pick = home_team in pick_lower
+                        p_score = home_score if is_home_pick else away_score
+                        o_score = away_score if is_home_pick else home_score
+
+                        diff = (p_score + spread_val) - o_score
+                        if diff == 0: status = "PUSH"
+                        elif diff > 0: status = "WIN"
                         else: status = "LOSS"
-                
-                elif "spread" in bet_type or re.search(r'[-+]\d+\.?\d*', pick_str):
-                    spread_match = re.search(r'([-+]\s*\d+\.?\d*)', pick_str) or re.search(r'([-+]\s*\d+\.?\d*)', bet_type)
-                    spread_val = float(spread_match.group(1).replace(" ", "")) if spread_match else 0.0
                     
-                    is_home_pick = match["home_team"] in pick_lower
-                    p_score = home_score if is_home_pick else away_score
-                    o_score = away_score if is_home_pick else home_score
-
-                    diff = (p_score + spread_val) - o_score
-                    if diff == 0: status = "PUSH"
-                    elif diff > 0: status = "WIN"
-                    else: status = "LOSS"
-                
-                else:
-                    if home_score == away_score:
-                        status = "PUSH"
                     else:
-                        winner = match["home_team"] if home_score > away_score else match["away_team"]
-                        is_win = (winner in pick_lower)
-                        status = "WIN" if is_win else "LOSS"
+                        if home_score == away_score:
+                            status = "PUSH"
+                        else:
+                            winner = home_team if home_score > away_score else away_team
+                            is_win = (winner in pick_lower)
+                            status = "WIN" if is_win else "LOSS"
 
-                if status in ["WIN", "LOSS", "PUSH"]:
-                    if status == "WIN":
-                        profit = (100 / abs(odds)) * 100 * units if odds < 0 else (odds / 100) * 100 * units
-                    elif status == "LOSS":
-                        profit = -100.0 * units
-                    elif status == "PUSH":
-                        profit = 0.0
+                    if status in ["WIN", "LOSS", "PUSH"]:
+                        if status == "WIN":
+                            profit = (100 / abs(odds)) * 100 * units if odds < 0 else (odds / 100) * 100 * units
+                        elif status == "LOSS":
+                            profit = -100.0 * units
+                        elif status == "PUSH":
+                            profit = 0.0
 
-                    print(f"Graded NFL Row {row_idx}: {r[game_idx]} [{pick_str}] -> {status} (${round(profit, 2)})")
-                    
-                    sheet.update_cell(row_idx, 11, status)
-                    sheet.update_cell(row_idx, 12, round(profit, 2))
-                    updates_made += 1
-                    time.sleep(1.2)
+                        print(f"Graded NFL Row {row_idx}: {r[game_idx]} [{pick_str}] -> {status} (${round(profit, 2)})")
+                        sheet.update_cell(row_idx, 11, status)
+                        sheet.update_cell(row_idx, 12, round(profit, 2))
+                        updates_made += 1
+                        time.sleep(1.2)
+                        break
 
         if updates_made > 0:
             print(f"Successfully auto-graded {updates_made} completed NFL bet(s)!")
@@ -265,7 +313,6 @@ def update_nfl_memory_from_sheet(sheet, memory):
 
 # --- 5. PENDING BET RETRIEVAL (WITH KICKOFF TIME FILTER) ---
 def get_pending_nfl_bets(sheet):
-    """Retrieves pending bets. Splits them into future bets (eligible for re-evaluation) vs in-progress/past bets."""
     try:
         rows = sheet.get_all_values()
         if len(rows) <= 1: return [], []
@@ -294,7 +341,6 @@ def get_pending_nfl_bets(sheet):
                     "odds": r[odds_idx]
                 }
                 all_pending.append(bet_dict)
-                # Only re-evaluate games scheduled for today or in the future
                 if game_date >= now_str:
                     upcoming_pending.append(bet_dict)
 
@@ -403,7 +449,8 @@ def main():
     spreadsheet, sheet = get_nfl_sheets()
     ensure_nfl_headers(sheet)
 
-    auto_grade_nfl_bets(sheet)
+    odds_key = os.environ.get("ODDS_API_KEY")
+    auto_grade_nfl_bets(sheet, odds_key)
 
     update_scoreboard(spreadsheet)
 
@@ -418,7 +465,6 @@ def main():
 
     print(f"Total Pending: {len(all_pending)} | Upcoming Eligible for Re-Evaluation: {len(upcoming_bets)} | Open Slots: {slots_to_fill}")
 
-    odds_key = os.environ.get("ODDS_API_KEY")
     scraped_text = scrape_nfl_sites()
     live_odds = fetch_nfl_odds(odds_key)
 

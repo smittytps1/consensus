@@ -69,7 +69,7 @@ def update_scoreboard(spreadsheet):
     except Exception as e:
         print(f"Notice updating Scoreboard: {e}")
 
-# --- 3. THE ODDS API AUTO-GRADER (7-DAY LOOKBACK) ---
+# --- 3. THE ODDS API AUTO-GRADER (3-DAY LOOKBACK) ---
 def auto_grade_nfl_bets(sheet, odds_key):
     try:
         rows = sheet.get_all_values()
@@ -93,7 +93,8 @@ def auto_grade_nfl_bets(sheet, odds_key):
 
         print(f"Checking results for {len(pending_rows)} pending NFL bet(s) via The Odds API...")
         
-        scores_url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores/?apiKey={odds_key}&daysFrom=7"
+        # FIX: The Odds API free tier only supports a maximum of 3 days lookback for scores.
+        scores_url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores/?apiKey={odds_key}&daysFrom=3"
         resp = requests.get(scores_url)
         if resp.status_code != 200:
             print(f"Could not fetch NFL score data. Status code: {resp.status_code}")
@@ -121,6 +122,7 @@ def auto_grade_nfl_bets(sheet, odds_key):
                 home_team = match.get("home_team", "").lower()
                 away_team = match.get("away_team", "").lower()
 
+                # Match teams to the game title
                 if home_team in game_title or away_team in game_title:
                     scores = match.get("scores")
                     if not scores or len(scores) < 2:

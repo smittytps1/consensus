@@ -93,7 +93,6 @@ def auto_grade_nfl_bets(sheet, odds_key):
 
         print(f"Checking results for {len(pending_rows)} pending NFL bet(s) via The Odds API...")
         
-        # 3-day lookback limit to comply with free tier Odds API
         scores_url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores/?apiKey={odds_key}&daysFrom=3"
         resp = requests.get(scores_url)
         if resp.status_code != 200:
@@ -104,7 +103,7 @@ def auto_grade_nfl_bets(sheet, odds_key):
         updates = []
 
         for row_idx, r in pending_rows:
-            pick_date_str = str(r[0]).strip()  # Column A: Date (YYYY-MM-DD)
+            pick_date_str = str(r[0]).strip()
             game_title = str(r[game_idx]).strip().lower()
             bet_type = str(r[bet_type_idx]).strip().lower()
             pick_str = str(r[pick_idx]).strip()
@@ -120,7 +119,6 @@ def auto_grade_nfl_bets(sheet, odds_key):
                 if not match.get("completed"):
                     continue
 
-                # 1. STRICT DATE GUARD: Match API commence date to the row's game date
                 commence_time_str = match.get("commence_time", "")
                 if commence_time_str:
                     try:
@@ -134,7 +132,6 @@ def auto_grade_nfl_bets(sheet, odds_key):
                 home_team = match.get("home_team", "").lower()
                 away_team = match.get("away_team", "").lower()
 
-                # 2. BOTH TEAMS MUST MATCH: Prevent single-team false positives
                 home_tokens = [t for t in home_team.split() if len(t) > 3]
                 away_tokens = [t for t in away_team.split() if len(t) > 3]
 
@@ -155,7 +152,6 @@ def auto_grade_nfl_bets(sheet, odds_key):
                 status = None
                 profit = 0.0
 
-                # 1. TOTALS
                 if "total" in bet_type or "over" in pick_lower or "under" in pick_lower:
                     num_match = re.search(r'[-+]?\d*\.?\d+', pick_str)
                     if num_match:
@@ -165,7 +161,6 @@ def auto_grade_nfl_bets(sheet, odds_key):
                         elif (is_over and total_score > line) or (not is_over and total_score < line): status = "WIN"
                         else: status = "LOSS"
 
-                # 2. SPREADS
                 elif "spread" in bet_type or re.search(r'[-+]\d+\.?\d*', pick_str):
                     spread_match = re.search(r'([-+]\s*\d+\.?\d*)', pick_str) or re.search(r'([-+]\s*\d+\.?\d*)', bet_type)
                     spread_val = float(spread_match.group(1).replace(" ", "")) if spread_match else 0.0
@@ -179,7 +174,6 @@ def auto_grade_nfl_bets(sheet, odds_key):
                     elif diff > 0: status = "WIN"
                     else: status = "LOSS"
 
-                # 3. MONEYLINES
                 else:
                     winner = home_team if home_score > away_score else away_team
                     is_win = any(t in pick_lower for t in winner.split() if len(t) > 3)
@@ -265,7 +259,7 @@ def update_nfl_memory_from_sheet(sheet, memory):
         print(f"NFL Memory update notice: {e}")
     return memory
 
-# --- 5. PENDING BET RETRIEVAL (WITH KICKOFF TIME FILTER) ---
+# --- 5. PENDING BET RETRIEVAL & FULL HISTORY ---
 def get_pending_nfl_bets(sheet):
     """Retrieves pending bets. Splits them into future bets (eligible for re-evaluation) vs in-progress/past bets."""
     try:
@@ -296,7 +290,6 @@ def get_pending_nfl_bets(sheet):
                     "odds": r[odds_idx]
                 }
                 all_pending.append(bet_dict)
-                # Only re-evaluate games scheduled for today or in the future
                 if game_date >= now_str:
                     upcoming_pending.append(bet_dict)
 
@@ -304,6 +297,30 @@ def get_pending_nfl_bets(sheet):
     except Exception as e:
         print(f"Notice retrieving pending NFL bets: {e}")
         return [], []
+
+def get_full_bet_history(sheet):
+    """Pulls the entire season of settled bets so Gemini can review all actual wins and losses."""
+    try:
+        rows = sheet.get_all_values()
+        if len(rows) <= 1: return []
+        headers = [h.strip() for h in rows[0]]
+        status_idx = headers.index("Status")
+        game_idx = headers.index("Game")
+        pick_idx = headers.index("Pick")
+        reason_idx = headers.index("Reasoning")
+        
+        settled = []
+        for r in reversed(rows[1:]):
+            if len(r) > status_idx and r[status_idx].strip().upper() in ["WIN", "LOSS", "PUSH"]:
+                settled.append({
+                    "game": r[game_idx],
+                    "pick": r[pick_idx],
+                    "status": r[status_idx].strip().upper(),
+                    "reasoning": r[reason_idx][:150] if len(r) > reason_idx else ""
+                })
+        return settled
+    except Exception:
+        return []
 
 # --- 6. SCRAPING & ODDS ---
 def scrape_nfl_sites():
@@ -343,13 +360,7 @@ def parse_json_from_response(response):
         except Exception: pass
     return {}
 
-# --- NEW: DETERMINISTIC LINE VERIFICATION ---
 def verify_pending_lines_deterministically(sheet, upcoming_bets, live_odds):
-    """
-    Checks live Odds API data directly in Python.
-    Automatically rejects any pending bet if the book no longer offers
-    the line/number logged in the spreadsheet.
-    """
     surviving_bets = []
     rejected_count = 0
 
@@ -359,14 +370,12 @@ def verify_pending_lines_deterministically(sheet, upcoming_bets, live_odds):
         bet_type = bet["bet_type"].lower()
         pick = bet["pick"]
         
-        # Identify bookmaker key (draftkings, fanduel, betmgm, caesars/williamhill_us)
         target_book = None
         if "draftkings" in bet_type: target_book = "draftkings"
         elif "fanduel" in bet_type: target_book = "fanduel"
         elif "betmgm" in bet_type: target_book = "betmgm"
         elif "caesars" in bet_type: target_book = "williamhill_us"
 
-        # Find matching game in live Odds API response
         matched_game = None
         for g in live_odds:
             h = g.get("home_team", "").lower()
@@ -377,11 +386,9 @@ def verify_pending_lines_deterministically(sheet, upcoming_bets, live_odds):
                 break
 
         if not matched_game:
-            # Game not on active odds board
             surviving_bets.append(bet)
             continue
 
-        # Locate bookmaker
         book_data = next((b for b in matched_game.get("bookmakers", []) if b.get("key") == target_book), None)
         if not book_data:
             print(f"Row {row_idx}: {target_book} no longer pricing {bet['game']}. Rejecting.")
@@ -390,7 +397,6 @@ def verify_pending_lines_deterministically(sheet, upcoming_bets, live_odds):
             rejected_count += 1
             continue
 
-        # Verify Spreads
         if "spread" in bet_type:
             spread_match = re.search(r'([-+]\d+\.?\d*)', pick)
             if not spread_match:
@@ -403,14 +409,11 @@ def verify_pending_lines_deterministically(sheet, upcoming_bets, live_odds):
             line_found = False
             if market:
                 for outcome in market.get("outcomes", []):
-                    # Check if team name matches and if spread point is still >= required number
                     team_sub = outcome.get("name", "").lower()
                     if team_sub in pick.lower() or any(t in pick.lower() for t in team_sub.split() if len(t) > 3):
                         current_point = float(outcome.get("point", 0.0))
-                        # If we bet +4.5, current point must be >= 4.5
                         if target_point > 0 and current_point >= target_point:
                             line_found = True
-                        # If we bet -2.5, current point must be <= -2.5 (e.g. -2.0 is worse, -3.0 is worse)
                         elif target_point < 0 and current_point <= target_point:
                             line_found = True
                         break
@@ -427,50 +430,61 @@ def verify_pending_lines_deterministically(sheet, upcoming_bets, live_odds):
     return surviving_bets
 
 # --- 7. AI EVALUATION & GENERATION ---
-def evaluate_and_generate_nfl(scraped_data, odds_data, upcoming_bets, memory, slots_to_fill):
+def evaluate_and_generate_nfl(scraped_data, odds_data, upcoming_bets, memory, slots_to_fill, sheet):
     api_key = os.environ.get("GEMINI_API_KEY")
     client = genai.Client(api_key=api_key)
+    
+    # Retrieve the entire season history rather than capping it
+    full_history = get_full_bet_history(sheet)
 
     prompt = f"""
-    You are an elite NFL quantitative betting consensus engine focused on Point Spreads, Totals, Key Numbers, and Injury Shifts.
+    You are an elite, multi-angle NFL quantitative analyst. Your objective is simply to find the absolute BEST bets on the board—whether they are Spreads, Game Totals (Over/Under), or Moneylines.
 
-    === HISTORICAL PERFORMANCE MEMORY ===
+    Do NOT fixate solely on key numbers or spread hooks (+3.5 / -2.5). Identify real situational advantages, sharp money alignment, efficiency mismatches, and market discrepancies across ALL available bet types.
+
+    === HISTORICAL RECORD & PERFORMANCE ===
     {json.dumps(memory, indent=2)}
 
-    === ACTIVE UPCOMING PICKS TO RE-EVALUATE (PRE-GAME ONLY) ===
+    === FULL SEASON SETTLED BET HISTORY & PERFORMANCE ===
+    {json.dumps(full_history, indent=2)}
+
+    === ACTIVE UPCOMING PICKS TO RE-EVALUATE ===
     {json.dumps(upcoming_bets, indent=2)}
 
-    === LATEST EXPERT PREDICTIONS & CONSENSUS (5 NFL SITES) ===
-    {scraped_data}
+    === EXPERT PREDICTIONS, CONSENSUS & SHARP INTEL ===
+    {scraped_data[:12000]}
 
-    === LATEST LIVE SPORTSBOOK ODDS (NFL) ===
+    === LIVE SPORTSBOOK ODDS ===
     {json.dumps(odds_data[:14], indent=2)}
 
     MANDATES:
-    1. RE-EVALUATION: Only evaluate the UPCOMING games listed above. If line movement or injuries invalidated the edge, action = "REJECTED". If still positive EV, action = "VALIDATED".
-    2. JUICE CEILING: No ML favorite steeper than -120.
-    3. SLOTS TO FILL: You may propose up to {slots_to_fill} new picks for upcoming games to fill card vacancies.
-    4. RETURN STRICT JSON:
-       {{
-         "validations": [
-           {{ "row_index": <int>, "action": "VALIDATED" or "REJECTED", "note": "Reason" }}
-         ],
-         "new_picks": [
-           {{
-             "date": "YYYY-MM-DD",
-             "game": "Away Team @ Home Team",
-             "bet_type": "Spread (DraftKings)",
-             "pick": "Team +/-X.X",
-             "odds": -110,
-             "implied_prob": "52.4%",
-             "model_prob": "57.5%",
-             "expected_value": "9.7%",
-             "units": 1.0,
-             "reasoning": "2 sentences explaining matchup edge",
-             "high_agreement": "Source breakdown"
-           }}
-         ]
-       }}
+    1. FIND THE BEST VALUE OVERALL: Evaluate Moneylines, Spreads, and Totals. Pick the side with the highest true expected value (EV) and best situational edge.
+    2. LEARN FROM HISTORY: Review the full season of settled bets above. Identify trends in your wins and losses. If backing bad offenses as underdogs failed, adjust your evaluation. If totals or road favorites proved more reliable, factor that in dynamically.
+    3. RE-EVALUATION: Only evaluate the UPCOMING games listed above. If line movement or injury news erased the edge, action = "REJECTED". If value remains, action = "VALIDATED".
+    4. JUICE CEILING: No Moneyline favorite steeper than -120. (Spreads/Totals standard juice applies).
+    5. SLOTS TO FILL: Propose up to {slots_to_fill} new bets to complete the card.
+
+    RETURN STRICT JSON ONLY:
+    {{
+      "validations": [
+        {{ "row_index": <int>, "action": "VALIDATED" or "REJECTED", "note": "Reason" }}
+      ],
+      "new_picks": [
+        {{
+          "date": "YYYY-MM-DD",
+          "game": "Away Team @ Home Team",
+          "bet_type": "Spread (DraftKings) | Moneyline (Caesars) | Total Over/Under (FanDuel)",
+          "pick": "Team Name +/-X.X or Over/Under XX.X",
+          "odds": -110,
+          "implied_prob": "52.4%",
+          "model_prob": "58.0%",
+          "expected_value": "10.7%",
+          "units": 1.0,
+          "reasoning": "Concise breakdown of why this is the highest EV edge on the board (matchup, efficiency, sharp consensus).",
+          "high_agreement": "Source consensus breakdown"
+        }}
+      ]
+    }}
     """
 
     for model_name in ["gemini-3.1-pro-preview", "gemini-3.7-flash", "gemini-3.6-flash"]:
@@ -500,7 +514,14 @@ def main():
     today_date_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
     upcoming_bets, all_pending = get_pending_nfl_bets(sheet)
-    active_games = {p["game"].strip().lower() for p in all_pending}
+    
+    # Track existing game tokens to catch and prevent flipped matchup duplicates
+    active_game_tokens = set()
+    for p in all_pending:
+        tokens = tuple(sorted([t for t in p["game"].lower().split() if len(t) > 3]))
+        active_game_tokens.add(tokens)
+        
+    slots_to_fill = max(0, 5 - len([b for b in all_pending if b["row_index"] in [u["row_index"] for u in upcoming_bets]]))
     
     print(f"Total Pending: {len(all_pending)} | Upcoming Eligible for Re-Evaluation: {len(upcoming_bets)}")
 
@@ -512,17 +533,13 @@ def main():
         update_nfl_evolution_log(spreadsheet, updated_memory, current_time_str)
         return
 
-    # --- DETERMINISTIC LINE VERIFICATION ---
-    # Intercept and reject changed lines before sending to Gemini
     upcoming_bets = verify_pending_lines_deterministically(sheet, upcoming_bets, live_odds)
-    
-    # Recalculate open slots after pruning rejected bets
     slots_to_fill = max(0, 5 - len([b for b in all_pending if b["row_index"] in [u["row_index"] for u in upcoming_bets]]))
     print(f"Open Slots to Fill: {slots_to_fill}")
 
-    result = evaluate_and_generate_nfl(scraped_text, live_odds, upcoming_bets, updated_memory, slots_to_fill)
+    # Pass the sheet directly to evaluate_and_generate_nfl so it can pull the full season history
+    result = evaluate_and_generate_nfl(scraped_text, live_odds, upcoming_bets, updated_memory, slots_to_fill, sheet)
 
-    # 1. Update Validations for UPCOMING games only
     validations = result.get("validations", [])
     for v in validations:
         row_idx = v.get("row_index")
@@ -534,15 +551,19 @@ def main():
                 sheet.update_cell(row_idx, 11, "REJECTED")
                 slots_to_fill += 1
 
-    # 2. Append New Picks
     new_picks = result.get("new_picks", [])
     added = 0
     for p in new_picks:
         if added >= slots_to_fill:
             break
+            
         game_name = p.get("game", "").strip()
-        if game_name.lower() in active_games:
+        pick_tokens = tuple(sorted([t for t in game_name.lower().split() if len(t) > 3]))
+        
+        # Skip if either configuration of this matchup is already active in the portfolio
+        if pick_tokens in active_game_tokens:
             continue
+            
         try: odds_val = float(p.get("odds", -110))
         except (ValueError, TypeError): odds_val = -110.0
 
@@ -555,7 +576,8 @@ def main():
             p.get("expected_value", ""), p.get("units", 1.0), "PENDING", 0.0, p.get("reasoning", ""),
             "NEW", p.get("high_agreement", "")
         ], value_input_option="USER_ENTERED")
-        active_games.add(game_name.lower())
+        
+        active_game_tokens.add(pick_tokens)
         added += 1
 
     print(f"Run complete: Validated {len(validations)} pick(s), added {added} new pick(s).")

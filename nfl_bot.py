@@ -93,7 +93,7 @@ def auto_grade_nfl_bets(sheet, odds_key):
 
         print(f"Checking results for {len(pending_rows)} pending NFL bet(s) via The Odds API...")
         
-        # FIX: The Odds API free tier only supports a maximum of 3 days lookback for scores.
+        # 3-day lookback limit to comply with free tier Odds API
         scores_url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores/?apiKey={odds_key}&daysFrom=3"
         resp = requests.get(scores_url)
         if resp.status_code != 200:
@@ -104,6 +104,7 @@ def auto_grade_nfl_bets(sheet, odds_key):
         updates = []
 
         for row_idx, r in pending_rows:
+            pick_date_str = str(r[0]).strip()  # Column A: Date (YYYY-MM-DD)
             game_title = str(r[game_idx]).strip().lower()
             bet_type = str(r[bet_type_idx]).strip().lower()
             pick_str = str(r[pick_idx]).strip()
@@ -119,62 +120,81 @@ def auto_grade_nfl_bets(sheet, odds_key):
                 if not match.get("completed"):
                     continue
 
+                # 1. STRICT DATE GUARD: Match API commence date to the row's game date
+                commence_time_str = match.get("commence_time", "")
+                if commence_time_str:
+                    try:
+                        game_dt_utc = datetime.fromisoformat(commence_time_str.replace("Z", "+00:00"))
+                        match_date_str = game_dt_utc.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+                        if pick_date_str != match_date_str:
+                            continue
+                    except Exception:
+                        pass
+
                 home_team = match.get("home_team", "").lower()
                 away_team = match.get("away_team", "").lower()
 
-                # Match teams to the game title
-                if home_team in game_title or away_team in game_title:
-                    scores = match.get("scores")
-                    if not scores or len(scores) < 2:
-                        continue
+                # 2. BOTH TEAMS MUST MATCH: Prevent single-team false positives
+                home_tokens = [t for t in home_team.split() if len(t) > 3]
+                away_tokens = [t for t in away_team.split() if len(t) > 3]
 
-                    home_score = next((int(s["score"]) for s in scores if s["name"].lower() == home_team), 0)
-                    away_score = next((int(s["score"]) for s in scores if s["name"].lower() == away_team), 0)
-                    total_score = home_score + away_score
+                h_match = any(token in game_title for token in home_tokens)
+                a_match = any(token in game_title for token in away_tokens)
 
-                    status = None
-                    profit = 0.0
+                if not (h_match and a_match):
+                    continue
 
-                    # 1. TOTALS
-                    if "total" in bet_type or "over" in pick_lower or "under" in pick_lower:
-                        num_match = re.search(r'[-+]?\d*\.?\d+', pick_str)
-                        if num_match:
-                            line = float(num_match.group(0))
-                            is_over = "over" in pick_lower
-                            if total_score == line: status = "PUSH"
-                            elif (is_over and total_score > line) or (not is_over and total_score < line): status = "WIN"
-                            else: status = "LOSS"
+                scores = match.get("scores")
+                if not scores or len(scores) < 2:
+                    continue
 
-                    # 2. SPREADS
-                    elif "spread" in bet_type or re.search(r'[-+]\d+\.?\d*', pick_str):
-                        spread_match = re.search(r'([-+]\s*\d+\.?\d*)', pick_str) or re.search(r'([-+]\s*\d+\.?\d*)', bet_type)
-                        spread_val = float(spread_match.group(1).replace(" ", "")) if spread_match else 0.0
-                        
-                        is_home = home_team in pick_lower
-                        p_score = home_score if is_home else away_score
-                        o_score = away_score if is_home else home_score
+                home_score = next((int(s["score"]) for s in scores if s["name"].lower() == home_team), 0)
+                away_score = next((int(s["score"]) for s in scores if s["name"].lower() == away_team), 0)
+                total_score = home_score + away_score
 
-                        diff = (p_score + spread_val) - o_score
-                        if diff == 0: status = "PUSH"
-                        elif diff > 0: status = "WIN"
+                status = None
+                profit = 0.0
+
+                # 1. TOTALS
+                if "total" in bet_type or "over" in pick_lower or "under" in pick_lower:
+                    num_match = re.search(r'[-+]?\d*\.?\d+', pick_str)
+                    if num_match:
+                        line = float(num_match.group(0))
+                        is_over = "over" in pick_lower
+                        if total_score == line: status = "PUSH"
+                        elif (is_over and total_score > line) or (not is_over and total_score < line): status = "WIN"
                         else: status = "LOSS"
 
-                    # 3. MONEYLINES
-                    else:
-                        winner = home_team if home_score > away_score else away_team
-                        is_win = (winner in pick_lower or pick_lower in winner)
-                        status = "WIN" if is_win else "LOSS"
+                # 2. SPREADS
+                elif "spread" in bet_type or re.search(r'[-+]\d+\.?\d*', pick_str):
+                    spread_match = re.search(r'([-+]\s*\d+\.?\d*)', pick_str) or re.search(r'([-+]\s*\d+\.?\d*)', bet_type)
+                    spread_val = float(spread_match.group(1).replace(" ", "")) if spread_match else 0.0
+                    
+                    is_home = any(t in pick_lower for t in home_team.split() if len(t) > 3)
+                    p_score = home_score if is_home else away_score
+                    o_score = away_score if is_home else home_score
 
-                    if status == "WIN":
-                        profit = (100 / abs(odds)) * 100 * units if odds < 0 else (odds / 100) * 100 * units
-                    elif status == "LOSS":
-                        profit = -100.0 * units
-                    elif status == "PUSH":
-                        profit = 0.0
+                    diff = (p_score + spread_val) - o_score
+                    if diff == 0: status = "PUSH"
+                    elif diff > 0: status = "WIN"
+                    else: status = "LOSS"
 
-                    print(f"Graded NFL Row {row_idx}: {r[game_idx]} [{pick_str}] -> {status} (${round(profit, 2)})")
-                    updates.append({"range": f"K{row_idx}:L{row_idx}", "values": [[status, round(profit, 2)]]})
-                    break
+                # 3. MONEYLINES
+                else:
+                    winner = home_team if home_score > away_score else away_team
+                    is_win = any(t in pick_lower for t in winner.split() if len(t) > 3)
+                    status = "WIN" if is_win else "LOSS"
+
+                if status == "WIN":
+                    profit = (100 / abs(odds)) * 100 * units if odds < 0 else (odds / 100) * 100 * units
+                elif status == "LOSS":
+                    profit = -100.0 * units
+                elif status == "PUSH":
+                    profit = 0.0
+
+                print(f"Graded NFL Row {row_idx}: {r[game_idx]} [{pick_str}] -> {status} (${round(profit, 2)})")
+                updates.append({"range": f"K{row_idx}:L{row_idx}", "values": [[status, round(profit, 2)]]})
+                break
 
         if updates:
             sheet.batch_update(updates)

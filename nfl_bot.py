@@ -119,7 +119,7 @@ def auto_grade_nfl_bets(sheet, odds_key):
                 if not match.get("completed"):
                     continue
 
-                # Support both ET and UTC to handle night-game date roll-over
+                # Support both ET and UTC to handle prime-time night-game date roll-over
                 commence_time_str = match.get("commence_time", "")
                 if commence_time_str:
                     try:
@@ -152,6 +152,7 @@ def auto_grade_nfl_bets(sheet, odds_key):
                 total_score = home_score + away_score
 
                 status = None
+                profit = 0.0
 
                 # 1. TOTALS
                 if "total" in bet_type or "over" in pick_lower or "under" in pick_lower:
@@ -263,7 +264,7 @@ def update_nfl_memory_from_sheet(sheet, memory):
         print(f"NFL Memory update notice: {e}")
     return memory
 
-# --- 5. PENDING BET RETRIEVAL & FULL HISTORY ---
+# --- 5. PENDING BET RETRIEVAL & FULL SEASON POST-MORTEM HISTORY ---
 def get_pending_nfl_bets(sheet):
     try:
         rows = sheet.get_all_values()
@@ -302,29 +303,36 @@ def get_pending_nfl_bets(sheet):
         return [], []
 
 def get_full_bet_history(sheet):
+    """Pulls the entire season of settled bets with untruncated reasoning, bet type, odds, and sources."""
     try:
         rows = sheet.get_all_values()
         if len(rows) <= 1: return []
         headers = [h.strip() for h in rows[0]]
         status_idx = headers.index("Status")
         game_idx = headers.index("Game")
+        bet_type_idx = headers.index("Bet Type / Sportsbook")
         pick_idx = headers.index("Pick")
+        odds_idx = headers.index("Odds")
         reason_idx = headers.index("Reasoning")
+        source_idx = headers.index("High Agreement & Source Breakdown")
         
         settled = []
         for r in reversed(rows[1:]):
             if len(r) > status_idx and r[status_idx].strip().upper() in ["WIN", "LOSS", "PUSH"]:
                 settled.append({
                     "game": r[game_idx],
+                    "bet_type": r[bet_type_idx],
                     "pick": r[pick_idx],
+                    "odds": r[odds_idx],
                     "status": r[status_idx].strip().upper(),
-                    "reasoning": r[reason_idx][:150] if len(r) > reason_idx else ""
+                    "reasoning": r[reason_idx] if len(r) > reason_idx else "",
+                    "sources": r[source_idx] if len(r) > source_idx else ""
                 })
         return settled
     except Exception:
         return []
 
-# --- 6. SCRAPING & ODDS (WITH KICKOFF TIME FILTER) ---
+# --- 6. SCRAPING, ODDS & DETERMINISTIC MATH ---
 def scrape_nfl_sites():
     sites = [
         ("NFL Pickwatch", "https://nflpickwatch.com/"),
@@ -376,6 +384,24 @@ def fetch_nfl_odds(odds_key):
             continue
 
     return valid_upcoming_games
+
+def calculate_true_ev(odds_val, model_prob_pct):
+    """
+    Calculates exact Implied Probability (%) and Expected Value (%) in Python
+    so Gemini cannot hallucinate or fudge the math.
+    """
+    if odds_val < 0:
+        implied_prob = abs(odds_val) / (abs(odds_val) + 100.0)
+        decimal_profit = 100.0 / abs(odds_val)
+    else:
+        implied_prob = 100.0 / (odds_val + 100.0)
+        decimal_profit = odds_val / 100.0
+
+    p_win = model_prob_pct / 100.0
+    p_loss = 1.0 - p_win
+
+    ev_pct = ((p_win * decimal_profit) - (p_loss * 1.0)) * 100.0
+    return round(implied_prob * 100.0, 2), round(ev_pct, 2)
 
 def parse_json_from_response(response):
     raw_text = getattr(response, "text", "")
@@ -456,16 +482,22 @@ def verify_pending_lines_deterministically(sheet, upcoming_bets, live_odds):
 
     return surviving_bets
 
-# --- 7. AI EVALUATION & GENERATION ---
+# --- 7. AI EVALUATION & GENERATION (ACTIVE LEARNING + ANTI-HALLUCINATION) ---
 def evaluate_and_generate_nfl(scraped_data, odds_data, upcoming_bets, memory, slots_to_fill, sheet):
     api_key = os.environ.get("GEMINI_API_KEY")
     client = genai.Client(api_key=api_key)
     full_history = get_full_bet_history(sheet)
 
     prompt = f"""
-    You are an elite, multi-angle NFL quantitative analyst. Your objective is simply to find the absolute BEST bets on the board—whether they are Spreads, Game Totals (Over/Under), or Moneylines.
+    You are an elite, conservative NFL quantitative analyst. Your objective is to identify genuine market inefficiencies across Spreads, Game Totals (Over/Under), and Moneylines.
 
-    Do NOT fixate solely on key numbers or spread hooks (+3.5 / -2.5). Identify real situational advantages, sharp money alignment, efficiency mismatches, and market discrepancies across ALL available bet types.
+    CRITICAL ANTI-HALLUCINATION & LEARNING RULES:
+    - Do NOT invent or inflate 'model_prob_num' just to fill slots. It is 100% acceptable to return 0, 1, or 2 picks if the board lacks value.
+    - NFL markets are highly efficient. A realistic edge on a strong play is ONLY 2.5% to 5.5% above the sportsbook's implied probability (e.g., 55.0% to 57.5% on a -110 bet).
+    - AUDIT YOUR PAST REASONING: Carefully review the FULL SEASON SETTLED BET HISTORY below. Identify which specific rationales, bet types, or consensus sources led to LOSSES versus WINS, and actively penalize setups that failed previously.
+    - You may ONLY project a win probability above the book's implied probability if you can cite EITHER:
+      (a) A concrete cross-book line/juice discrepancy in the LIVE SPORTSBOOK ODDS below (e.g., Book A is -2.5 at -110 while Books B & C are -3.0 or -120), OR
+      (b) Strong, explicit alignment from the scraped expert consensus.
 
     === HISTORICAL RECORD & PERFORMANCE ===
     {json.dumps(memory, indent=2)}
@@ -483,14 +515,14 @@ def evaluate_and_generate_nfl(scraped_data, odds_data, upcoming_bets, memory, sl
     {json.dumps(odds_data[:14], indent=2)}
 
     MANDATES:
-    1. SELECT ONLY FROM THE LIVE ODDS PROVIDED: Every single new pick MUST correspond to a game in the LIVE SPORTSBOOK ODDS section. Do NOT bet on games that have already kicked off or are missing from the odds list.
-    2. USE THE game_date_et FIELD: Use the exact 'game_date_et' from the odds object as your 'date' field to prevent UTC midnight rollover.
-    3. FIND THE BEST VALUE OVERALL: Evaluate Moneylines, Spreads, and Totals. Pick the side with the highest true expected value (EV).
-    4. JUICE CEILING: No Moneyline favorite steeper than -120. (Spreads/Totals standard juice applies).
-    5. SLOTS TO FILL: Propose up to {slots_to_fill} new bets to complete the card.
+    1. SELECT ONLY FROM THE LIVE ODDS PROVIDED: Every new pick MUST match an exact bookmaker line and price in the LIVE SPORTSBOOK ODDS section.
+    2. USE THE game_date_et FIELD: Use 'game_date_et' as your 'date' field.
+    3. JUICE CEILING: No Moneyline favorite steeper than -120.
+    4. QUALITY OVER QUANTITY: You have up to {slots_to_fill} open slots, but ONLY output plays with a verifiable pricing discrepancy or sharp consensus edge. Return an empty list [] if no true edges exist.
 
-    RETURN STRICT JSON ONLY:
+    RETURN STRICT JSON ONLY (Python will calculate Implied Prob and EV):
     {{
+      "strategy_adjustment": "1-2 sentences summarizing specific lessons learned from settled WIN/LOSS reasoning patterns and how you are calibrating Model Prob today.",
       "validations": [
         {{ "row_index": <int>, "action": "VALIDATED" or "REJECTED", "note": "Reason" }}
       ],
@@ -501,11 +533,9 @@ def evaluate_and_generate_nfl(scraped_data, odds_data, upcoming_bets, memory, sl
           "bet_type": "Spread (DraftKings) | Moneyline (Caesars) | Total Over/Under (FanDuel)",
           "pick": "Team Name +/-X.X or Over/Under XX.X",
           "odds": -110,
-          "implied_prob": "52.4%",
-          "model_prob": "58.0%",
-          "expected_value": "10.7%",
+          "model_prob_num": 55.8,
           "units": 1.0,
-          "reasoning": "Concise breakdown of why this is the highest EV edge on the board (matchup, efficiency, sharp consensus).",
+          "reasoning": "Cite the exact cross-book odds discrepancy, matchup factor, and how this aligns with historical lessons.",
           "high_agreement": "Source consensus breakdown"
         }}
       ]
@@ -562,6 +592,14 @@ def main():
 
     result = evaluate_and_generate_nfl(scraped_text, live_odds, upcoming_bets, updated_memory, slots_to_fill, sheet)
 
+    # Save Gemini's active post-mortem learning into memory and the Evolution tab
+    new_learning = result.get("strategy_adjustment")
+    if new_learning:
+        updated_memory["learnings_and_adjustments"] = new_learning
+        with open("nfl_bot_memory.json", "w") as f:
+            json.dump(updated_memory, f, indent=2)
+
+    # 1. Process Validations
     validations = result.get("validations", [])
     for v in validations:
         row_idx = v.get("row_index")
@@ -572,6 +610,10 @@ def main():
             if action == "REJECTED":
                 sheet.update_cell(row_idx, 11, "REJECTED")
                 slots_to_fill += 1
+
+    # 2. Append New Picks (With Deterministic Python EV Calculation & Hard Floor)
+    MIN_EV_THRESHOLD = 4.0  # Realistic, un-inflated NFL EV floor (4.0%+)
+    MAX_PROB_EDGE = 6.0     # Cap model probability at +6.0% over implied prob to prevent LLM exaggeration
 
     new_picks = result.get("new_picks", [])
     added = 0
@@ -585,17 +627,53 @@ def main():
         if pick_tokens in active_game_tokens:
             continue
             
-        try: odds_val = float(p.get("odds", -110))
-        except (ValueError, TypeError): odds_val = -110.0
+        try:
+            odds_val = float(p.get("odds", -110))
+        except (ValueError, TypeError):
+            odds_val = -110.0
 
         if "moneyline" in p.get("bet_type", "").lower() and odds_val < -120:
             continue
 
+        # Parse Gemini's model probability
+        raw_prob = str(p.get("model_prob_num", p.get("model_prob", "0"))).replace("%", "").strip()
+        try:
+            model_prob_val = float(raw_prob)
+        except ValueError:
+            continue
+
+        # Calculate initial implied probability
+        implied_prob_val, _ = calculate_true_ev(odds_val, model_prob_val)
+
+        # Guardrail: Clamp realistic probability edge so Gemini cannot invent 15% edges
+        if (model_prob_val - implied_prob_val) > MAX_PROB_EDGE:
+            print(f"Clamping exaggerated model_prob ({model_prob_val}%) on {p.get('pick')}")
+            model_prob_val = round(implied_prob_val + MAX_PROB_EDGE, 2)
+
+        # Deterministically compute final Implied Prob and EV in Python
+        implied_prob_val, ev_val = calculate_true_ev(odds_val, model_prob_val)
+
+        # Hard EV Gate: Skip any bet that does not clear the mathematical floor
+        if ev_val < MIN_EV_THRESHOLD:
+            print(f"Skipping {p.get('pick')}: True EV ({ev_val}%) is below {MIN_EV_THRESHOLD}% minimum.")
+            continue
+
         sheet.append_row([
-            p.get("date", today_date_str), current_time_str, game_name, p.get("bet_type", ""),
-            p.get("pick", ""), odds_val, p.get("implied_prob", ""), p.get("model_prob", ""),
-            p.get("expected_value", ""), p.get("units", 1.0), "PENDING", 0.0, p.get("reasoning", ""),
-            "NEW", p.get("high_agreement", "")
+            p.get("date", today_date_str),
+            current_time_str,
+            game_name,
+            p.get("bet_type", ""),
+            p.get("pick", ""),
+            odds_val,
+            f"{implied_prob_val}%",
+            f"{model_prob_val}%",
+            f"{ev_val}%",
+            p.get("units", 1.0),
+            "PENDING",
+            0.0,
+            p.get("reasoning", ""),
+            "NEW",
+            p.get("high_agreement", "")
         ], value_input_option="USER_ENTERED")
         
         active_game_tokens.add(pick_tokens)

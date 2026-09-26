@@ -4,7 +4,7 @@ import re
 import time
 import requests
 import gspread
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from playwright.sync_api import sync_playwright
 from google.oauth2.service_account import Credentials
@@ -69,7 +69,7 @@ def update_scoreboard(spreadsheet):
     except Exception as e:
         print(f"Notice updating Scoreboard: {e}")
 
-# --- 3. THE ODDS API AUTO-GRADER (3-DAY LOOKBACK) ---
+# --- 3. THE ODDS API AUTO-GRADER (3-DAY LOOKBACK WITH DUAL-DATE MATCHING) ---
 def auto_grade_nfl_bets(sheet, odds_key):
     try:
         rows = sheet.get_all_values()
@@ -119,12 +119,14 @@ def auto_grade_nfl_bets(sheet, odds_key):
                 if not match.get("completed"):
                     continue
 
+                # Support both ET and UTC to handle night-game date roll-over
                 commence_time_str = match.get("commence_time", "")
                 if commence_time_str:
                     try:
                         game_dt_utc = datetime.fromisoformat(commence_time_str.replace("Z", "+00:00"))
-                        match_date_str = game_dt_utc.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
-                        if pick_date_str != match_date_str:
+                        match_date_et = game_dt_utc.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+                        match_date_utc = game_dt_utc.strftime("%Y-%m-%d")
+                        if pick_date_str not in (match_date_et, match_date_utc):
                             continue
                     except Exception:
                         pass
@@ -150,8 +152,8 @@ def auto_grade_nfl_bets(sheet, odds_key):
                 total_score = home_score + away_score
 
                 status = None
-                profit = 0.0
 
+                # 1. TOTALS
                 if "total" in bet_type or "over" in pick_lower or "under" in pick_lower:
                     num_match = re.search(r'[-+]?\d*\.?\d+', pick_str)
                     if num_match:
@@ -161,6 +163,7 @@ def auto_grade_nfl_bets(sheet, odds_key):
                         elif (is_over and total_score > line) or (not is_over and total_score < line): status = "WIN"
                         else: status = "LOSS"
 
+                # 2. SPREADS
                 elif "spread" in bet_type or re.search(r'[-+]\d+\.?\d*', pick_str):
                     spread_match = re.search(r'([-+]\s*\d+\.?\d*)', pick_str) or re.search(r'([-+]\s*\d+\.?\d*)', bet_type)
                     spread_val = float(spread_match.group(1).replace(" ", "")) if spread_match else 0.0
@@ -174,6 +177,7 @@ def auto_grade_nfl_bets(sheet, odds_key):
                     elif diff > 0: status = "WIN"
                     else: status = "LOSS"
 
+                # 3. MONEYLINES
                 else:
                     winner = home_team if home_score > away_score else away_team
                     is_win = any(t in pick_lower for t in winner.split() if len(t) > 3)
@@ -221,7 +225,7 @@ def update_nfl_evolution_log(spreadsheet, memory, current_time_str):
             memory.get("total_bets", 0),
             memory.get("win_rate", "0%"),
             memory.get("net_profit_dollars", 0.0),
-            memory.get("learnings_and_adjustments", "Respect key numbers (3 & 7), enforce -120 juice cap.")
+            memory.get("learnings_and_adjustments", "Evaluate best overall EV; enforce kickoff cutoff & -120 juice ceiling.")
         ])
         print("NFL Evolution tab updated successfully!")
     except Exception as e:
@@ -234,7 +238,7 @@ def load_nfl_memory():
         except Exception: pass
     default_memory = {
         "total_bets": 0, "wins": 0, "losses": 0, "win_rate": "0%", "net_profit_dollars": 0.0,
-        "learnings_and_adjustments": "Respect key football numbers (3 and 7). Avoid moneyline favorites steeper than -120."
+        "learnings_and_adjustments": "Evaluate best overall EV; enforce kickoff cutoff & -120 juice ceiling."
     }
     with open("nfl_bot_memory.json", "w") as f: json.dump(default_memory, f, indent=2)
     return default_memory
@@ -261,7 +265,6 @@ def update_nfl_memory_from_sheet(sheet, memory):
 
 # --- 5. PENDING BET RETRIEVAL & FULL HISTORY ---
 def get_pending_nfl_bets(sheet):
-    """Retrieves pending bets. Splits them into future bets (eligible for re-evaluation) vs in-progress/past bets."""
     try:
         rows = sheet.get_all_values()
         if len(rows) <= 1: return [], []
@@ -299,7 +302,6 @@ def get_pending_nfl_bets(sheet):
         return [], []
 
 def get_full_bet_history(sheet):
-    """Pulls the entire season of settled bets so Gemini can review all actual wins and losses."""
     try:
         rows = sheet.get_all_values()
         if len(rows) <= 1: return []
@@ -322,7 +324,7 @@ def get_full_bet_history(sheet):
     except Exception:
         return []
 
-# --- 6. SCRAPING & ODDS ---
+# --- 6. SCRAPING & ODDS (WITH KICKOFF TIME FILTER) ---
 def scrape_nfl_sites():
     sites = [
         ("NFL Pickwatch", "https://nflpickwatch.com/"),
@@ -346,9 +348,34 @@ def scrape_nfl_sites():
     return scraped_text
 
 def fetch_nfl_odds(odds_key):
+    """Fetches odds and strictly excludes games that have already kicked off or start within 15 minutes."""
     url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds/?apiKey={odds_key}&regions=us&markets=h2h,spreads,totals&bookmakers=draftkings,fanduel,betmgm,williamhill_us&oddsFormat=american"
     resp = requests.get(url)
-    return resp.json() if resp.status_code == 200 else []
+    if resp.status_code != 200:
+        return []
+    
+    odds_data = resp.json()
+    now_utc = datetime.now(timezone.utc)
+    valid_upcoming_games = []
+
+    for game in odds_data:
+        ct_str = game.get("commence_time")
+        if not ct_str:
+            continue
+        try:
+            kickoff_dt = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
+            # Skip games that already started or start in under 15 minutes
+            if kickoff_dt <= (now_utc + timedelta(minutes=15)):
+                continue
+            
+            # Explicitly store US Eastern Time calendar date
+            dt_et = kickoff_dt.astimezone(ZoneInfo("America/New_York"))
+            game["game_date_et"] = dt_et.strftime("%Y-%m-%d")
+            valid_upcoming_games.append(game)
+        except Exception:
+            continue
+
+    return valid_upcoming_games
 
 def parse_json_from_response(response):
     raw_text = getattr(response, "text", "")
@@ -433,8 +460,6 @@ def verify_pending_lines_deterministically(sheet, upcoming_bets, live_odds):
 def evaluate_and_generate_nfl(scraped_data, odds_data, upcoming_bets, memory, slots_to_fill, sheet):
     api_key = os.environ.get("GEMINI_API_KEY")
     client = genai.Client(api_key=api_key)
-    
-    # Retrieve the entire season history rather than capping it
     full_history = get_full_bet_history(sheet)
 
     prompt = f"""
@@ -454,13 +479,13 @@ def evaluate_and_generate_nfl(scraped_data, odds_data, upcoming_bets, memory, sl
     === EXPERT PREDICTIONS, CONSENSUS & SHARP INTEL ===
     {scraped_data[:12000]}
 
-    === LIVE SPORTSBOOK ODDS ===
+    === LIVE SPORTSBOOK ODDS (ALL FUTURE KICKOFFS) ===
     {json.dumps(odds_data[:14], indent=2)}
 
     MANDATES:
-    1. FIND THE BEST VALUE OVERALL: Evaluate Moneylines, Spreads, and Totals. Pick the side with the highest true expected value (EV) and best situational edge.
-    2. LEARN FROM HISTORY: Review the full season of settled bets above. Identify trends in your wins and losses. If backing bad offenses as underdogs failed, adjust your evaluation. If totals or road favorites proved more reliable, factor that in dynamically.
-    3. RE-EVALUATION: Only evaluate the UPCOMING games listed above. If line movement or injury news erased the edge, action = "REJECTED". If value remains, action = "VALIDATED".
+    1. SELECT ONLY FROM THE LIVE ODDS PROVIDED: Every single new pick MUST correspond to a game in the LIVE SPORTSBOOK ODDS section. Do NOT bet on games that have already kicked off or are missing from the odds list.
+    2. USE THE game_date_et FIELD: Use the exact 'game_date_et' from the odds object as your 'date' field to prevent UTC midnight rollover.
+    3. FIND THE BEST VALUE OVERALL: Evaluate Moneylines, Spreads, and Totals. Pick the side with the highest true expected value (EV).
     4. JUICE CEILING: No Moneyline favorite steeper than -120. (Spreads/Totals standard juice applies).
     5. SLOTS TO FILL: Propose up to {slots_to_fill} new bets to complete the card.
 
@@ -515,21 +540,19 @@ def main():
 
     upcoming_bets, all_pending = get_pending_nfl_bets(sheet)
     
-    # Track existing game tokens to catch and prevent flipped matchup duplicates
+    # Track existing games (either home/away ordering) to prevent duplicates
     active_game_tokens = set()
     for p in all_pending:
         tokens = tuple(sorted([t for t in p["game"].lower().split() if len(t) > 3]))
         active_game_tokens.add(tokens)
         
-    slots_to_fill = max(0, 5 - len([b for b in all_pending if b["row_index"] in [u["row_index"] for u in upcoming_bets]]))
-    
     print(f"Total Pending: {len(all_pending)} | Upcoming Eligible for Re-Evaluation: {len(upcoming_bets)}")
 
     scraped_text = scrape_nfl_sites()
     live_odds = fetch_nfl_odds(odds_key)
 
     if not live_odds or not scraped_text:
-        print("Missing live odds or scraped text. Exiting.")
+        print("Missing live upcoming odds or scraped text. Exiting.")
         update_nfl_evolution_log(spreadsheet, updated_memory, current_time_str)
         return
 
@@ -537,7 +560,6 @@ def main():
     slots_to_fill = max(0, 5 - len([b for b in all_pending if b["row_index"] in [u["row_index"] for u in upcoming_bets]]))
     print(f"Open Slots to Fill: {slots_to_fill}")
 
-    # Pass the sheet directly to evaluate_and_generate_nfl so it can pull the full season history
     result = evaluate_and_generate_nfl(scraped_text, live_odds, upcoming_bets, updated_memory, slots_to_fill, sheet)
 
     validations = result.get("validations", [])
@@ -560,7 +582,6 @@ def main():
         game_name = p.get("game", "").strip()
         pick_tokens = tuple(sorted([t for t in game_name.lower().split() if len(t) > 3]))
         
-        # Skip if either configuration of this matchup is already active in the portfolio
         if pick_tokens in active_game_tokens:
             continue
             

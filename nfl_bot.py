@@ -256,7 +256,7 @@ def update_nfl_memory_from_sheet(rows, memory):
         pass
     return memory
 
-# --- 5. DATA EXTRACTION & ROBUST DEDUPLICATION HELPERS ---
+# --- 5. DATA EXTRACTION & MATCHUP EQUALITY ---
 def get_pending_nfl_bets(rows):
     if len(rows) <= 1: return [], []
     headers = [h.strip() for h in rows[0]]
@@ -319,7 +319,7 @@ def get_full_bet_history(rows):
     return settled
 
 def are_games_equal(game1, game2):
-    """Robust bidirectional matchup equality (handles Away @ Home vs Home @ Away)."""
+    """Bidirectional team matchup equality handler."""
     stop_words = {'at', 'vs', 'the', 'and', '@'}
     t1 = {w for w in re.sub(r'[@\-_vs\.]', ' ', game1.lower()).split() if len(w) > 2 and w not in stop_words}
     t2 = {w for w in re.sub(r'[@\-_vs\.]', ' ', game2.lower()).split() if len(w) > 2 and w not in stop_words}
@@ -399,14 +399,15 @@ def parse_json_from_response(response):
         except Exception: pass
     return {}
 
-# --- 7. PHASE 1: EVALUATE & PRUNE OPEN BETS ---
+# --- 7. PHASE 1: EVALUATE & PRUNE OPEN BETS (UPDATES COLUMN N) ---
 def reevaluate_open_bets(sheet, upcoming_bets, live_odds, scraped_text, full_history):
     """
     Step-by-step re-evaluation of current pending bets:
-    1. Python deterministic line check (did line vanish or move past thresholds?).
-    2. Gemini consensus verification (is the expert consensus thesis still intact?).
-    Updates sheet rows to VALIDATED or REJECTED.
-    Returns the list of surviving validated bet dictionaries.
+    1. Deterministic line verification via The Odds API.
+    2. Qualitative consensus audit via Gemini.
+    Updates Column N (Validation) to VALIDATED or REJECTED.
+    Updates Column K (Status) to REJECTED if dropped.
+    Returns only the list of surviving VALIDATED bets.
     """
     if not upcoming_bets:
         return []
@@ -434,15 +435,15 @@ def reevaluate_open_bets(sheet, upcoming_bets, live_odds, scraped_text, full_his
                 break
 
         if not matched_game:
-            # Game kickoff passed or board closed; leave as is
+            # Game kickoff passed or temporarily off board; leave pending as is
             surviving_after_python.append(bet)
             continue
 
         book_data = next((b for b in matched_game.get("bookmakers", []) if b.get("key") == target_book), None)
         if not book_data:
-            print(f"Row {row_idx}: {target_book} no longer offers {bet['game']}. Rejecting.")
-            sheet.update_cell(row_idx, 11, "REJECTED")
-            sheet.update_cell(row_idx, 14, "REJECTED")
+            print(f"Row {row_idx}: {target_book} no longer offers {bet['game']}. Marking REJECTED in Col N.")
+            sheet.update_cell(row_idx, 11, "REJECTED")  # Col K: Status
+            sheet.update_cell(row_idx, 14, "REJECTED")  # Col N: Validation
             continue
 
         if "spread" in bet_type:
@@ -462,9 +463,9 @@ def reevaluate_open_bets(sheet, upcoming_bets, live_odds, scraped_text, full_his
                                 line_found = True
                             break
                 if not line_found:
-                    print(f"Row {row_idx}: Line moved against {pick}. Rejecting.")
-                    sheet.update_cell(row_idx, 11, "REJECTED")
-                    sheet.update_cell(row_idx, 14, "REJECTED")
+                    print(f"Row {row_idx}: Line moved against {pick}. Marking REJECTED in Col N.")
+                    sheet.update_cell(row_idx, 11, "REJECTED")  # Col K: Status
+                    sheet.update_cell(row_idx, 14, "REJECTED")  # Col N: Validation
                     continue
 
         surviving_after_python.append(bet)
@@ -472,7 +473,7 @@ def reevaluate_open_bets(sheet, upcoming_bets, live_odds, scraped_text, full_his
     if not surviving_after_python:
         return []
 
-    # 2. AI qualitative consensus audit for surviving bets
+    # 2. Qualitative consensus audit for surviving bets
     api_key = os.environ.get("GEMINI_API_KEY")
     client = genai.Client(api_key=api_key)
 
@@ -512,17 +513,19 @@ def reevaluate_open_bets(sheet, upcoming_bets, live_odds, scraped_text, full_his
     for bet in surviving_after_python:
         r_idx = bet["row_index"]
         decision = val_map.get(r_idx, "VALIDATED")
+        
         if decision == "REJECTED":
-            print(f"Row {r_idx}: Gemini flagged {bet['pick']} as REJECTED.")
-            sheet.update_cell(r_idx, 11, "REJECTED")
-            sheet.update_cell(r_idx, 14, "REJECTED")
+            print(f"Row {r_idx}: Flagged REJECTED. Updating Col N to REJECTED.")
+            sheet.update_cell(r_idx, 11, "REJECTED")  # Col K: Status
+            sheet.update_cell(r_idx, 14, "REJECTED")  # Col N: Validation
         else:
-            sheet.update_cell(r_idx, 14, "VALIDATED")
+            print(f"Row {r_idx}: Validated {bet['pick']}. Updating Col N to VALIDATED.")
+            sheet.update_cell(r_idx, 14, "VALIDATED") # Col N: Validation
             final_surviving.append(bet)
 
     return final_surviving
 
-# --- 8. PHASE 2: GENERATE NEW PICKS (STRICT ANTI-DUPLICATION) ---
+# --- 8. PHASE 2: GENERATE NEW PICKS (STRICT ANTI-DUPLICATION OF OPEN BETS) ---
 def generate_additional_picks(scraped_text, live_odds, surviving_bets, slots_to_fill, full_history, memory):
     if slots_to_fill <= 0:
         return {"strategy_adjustment": "Card full with validated open plays.", "new_picks": []}
@@ -536,9 +539,9 @@ def generate_additional_picks(scraped_text, live_odds, surviving_bets, slots_to_
     You are an elite NFL quantitative analyst. Your task is to select up to {slots_to_fill} NEW bets following a strict 4-step workflow.
 
     CRITICAL DEDUPLICATION RULE:
-    The following games are ALREADY ON OUR CARD as active open bets:
+    The following games are ALREADY ON OUR CARD as active validated bets:
     {json.dumps(excluded_games, indent=2)}
-    DO NOT PICK ANY OF THESE GAMES OR TEAMS. Pick only from the remaining available matchups.
+    DO NOT PICK ANY OF THESE MATCHUPS. Pick only from the other available games.
 
     WORKFLOW HIERARCHY:
     1. HISTORICAL TREND CALIBRATION (STEP 1):
@@ -561,7 +564,7 @@ def generate_additional_picks(scraped_text, live_odds, surviving_bets, slots_to_
     {scraped_text[:12000]}
 
     === LIVE SPORTSBOOK ODDS ===
-    {json.dumps(odds_data[:14], indent=2)}
+    {json.dumps(live_odds[:14], indent=2)}
 
     RETURN STRICT JSON ONLY:
     {{
@@ -594,7 +597,6 @@ def generate_additional_picks(scraped_text, live_odds, surviving_bets, slots_to_
 
 # --- 9. MAIN PIPELINE ---
 def main():
-    global odds_data
     spreadsheet, sheet = get_nfl_sheets()
     ensure_nfl_headers(sheet)
 
@@ -602,7 +604,7 @@ def main():
     if odds_key:
         auto_grade_nfl_bets(sheet, odds_key)
 
-    # Single read snapshot
+    # Single-read sheet snapshot
     try:
         rows = sheet.get_all_values()
     except Exception as e:
@@ -623,18 +625,17 @@ def main():
 
     scraped_text = scrape_nfl_sites()
     live_odds = fetch_nfl_odds(odds_key)
-    odds_data = live_odds
 
     if not live_odds or not scraped_text:
         print("Missing live upcoming odds or scraped text. Exiting.")
         update_nfl_evolution_log(spreadsheet, updated_memory, current_time_str)
         return
 
-    # PHASE 1: Re-evaluate open bets
+    # PHASE 1: Re-evaluate open bets and stamp Column N (Validation) & Column K (Status)
     surviving_bets = reevaluate_open_bets(sheet, upcoming_bets, live_odds, scraped_text, full_history)
     print(f"Surviving Validated Bets: {len(surviving_bets)}")
 
-    # PHASE 2: Fill remaining slots up to 5
+    # PHASE 2: Fill remaining open slots up to 5
     slots_to_fill = max(0, 5 - len(surviving_bets))
     print(f"Open Slots to Fill: {slots_to_fill}")
 
@@ -657,9 +658,9 @@ def main():
 
         game_name = p.get("game", "").strip()
 
-        # Hard anti-duplication against surviving open bets
+        # Deduplicate strictly against currently active, validated pending bets
         if any(are_games_equal(game_name, b["game"]) for b in surviving_bets):
-            print(f"Skipping duplicate of open bet: {game_name}")
+            print(f"Skipping {game_name}: Already an active validated pending bet.")
             continue
 
         try: odds_val = float(p.get("odds", -110))
@@ -700,7 +701,7 @@ def main():
             p.get("high_agreement", "")
         ], value_input_option="USER_ENTERED")
 
-        # Add to surviving set to prevent subsequent picks in the same run from duplicating
+        # Dynamically append to surviving set so subsequent picks in the same run do not duplicate
         surviving_bets.append({"game": game_name})
         added += 1
 

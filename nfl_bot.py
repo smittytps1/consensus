@@ -47,7 +47,6 @@ def ensure_nfl_headers(sheet):
 
 # --- 2. DYNAMIC SCOREBOARD TAB ---
 def update_scoreboard(spreadsheet):
-    """Creates or updates the Scoreboard tab with live formulas for MLB and NFL."""
     try:
         try:
             sb_sheet = spreadsheet.worksheet("Scoreboard")
@@ -69,7 +68,7 @@ def update_scoreboard(spreadsheet):
     except Exception as e:
         print(f"Notice updating Scoreboard: {e}")
 
-# --- 3. THE ODDS API AUTO-GRADER (3-DAY LOOKBACK WITH DUAL-DATE MATCHING) ---
+# --- 3. THE ODDS API AUTO-GRADER ---
 def auto_grade_nfl_bets(sheet, odds_key):
     try:
         rows = sheet.get_all_values()
@@ -96,7 +95,6 @@ def auto_grade_nfl_bets(sheet, odds_key):
         scores_url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores/?apiKey={odds_key}&daysFrom=3"
         resp = requests.get(scores_url)
         if resp.status_code != 200:
-            print(f"Could not fetch NFL score data. Status code: {resp.status_code}")
             return 0
 
         scores_data = resp.json()
@@ -119,7 +117,6 @@ def auto_grade_nfl_bets(sheet, odds_key):
                 if not match.get("completed"):
                     continue
 
-                # Support both ET and UTC to handle prime-time night-game date roll-over
                 commence_time_str = match.get("commence_time", "")
                 if commence_time_str:
                     try:
@@ -154,7 +151,6 @@ def auto_grade_nfl_bets(sheet, odds_key):
                 status = None
                 profit = 0.0
 
-                # 1. TOTALS
                 if "total" in bet_type or "over" in pick_lower or "under" in pick_lower:
                     num_match = re.search(r'[-+]?\d*\.?\d+', pick_str)
                     if num_match:
@@ -164,7 +160,6 @@ def auto_grade_nfl_bets(sheet, odds_key):
                         elif (is_over and total_score > line) or (not is_over and total_score < line): status = "WIN"
                         else: status = "LOSS"
 
-                # 2. SPREADS
                 elif "spread" in bet_type or re.search(r'[-+]\d+\.?\d*', pick_str):
                     spread_match = re.search(r'([-+]\s*\d+\.?\d*)', pick_str) or re.search(r'([-+]\s*\d+\.?\d*)', bet_type)
                     spread_val = float(spread_match.group(1).replace(" ", "")) if spread_match else 0.0
@@ -178,7 +173,6 @@ def auto_grade_nfl_bets(sheet, odds_key):
                     elif diff > 0: status = "WIN"
                     else: status = "LOSS"
 
-                # 3. MONEYLINES
                 else:
                     winner = home_team if home_score > away_score else away_team
                     is_win = any(t in pick_lower for t in winner.split() if len(t) > 3)
@@ -228,9 +222,8 @@ def update_nfl_evolution_log(spreadsheet, memory, current_time_str):
             memory.get("net_profit_dollars", 0.0),
             memory.get("learnings_and_adjustments", "Evaluate best overall EV; enforce kickoff cutoff & -120 juice ceiling.")
         ])
-        print("NFL Evolution tab updated successfully!")
     except Exception as e:
-        print(f"Notice logging to NFL Evolution tab: {e}")
+        pass
 
 def load_nfl_memory():
     if os.path.exists("nfl_bot_memory.json"):
@@ -244,9 +237,8 @@ def load_nfl_memory():
     with open("nfl_bot_memory.json", "w") as f: json.dump(default_memory, f, indent=2)
     return default_memory
 
-def update_nfl_memory_from_sheet(sheet, memory):
+def update_nfl_memory_from_sheet(rows, memory):
     try:
-        rows = sheet.get_all_values()
         if len(rows) <= 1: return memory
         headers = [h.strip() for h in rows[0]]
         status_idx, pl_idx = headers.index("Status"), headers.index("P/L ($)")
@@ -261,15 +253,13 @@ def update_nfl_memory_from_sheet(sheet, memory):
             memory["net_profit_dollars"] = round(sum(float(r[pl_idx] or 0.0) for r in rows[1:] if len(r) > pl_idx and r[pl_idx]), 2)
         with open("nfl_bot_memory.json", "w") as f: json.dump(memory, f, indent=2)
     except Exception as e:
-        print(f"NFL Memory update notice: {e}")
+        pass
     return memory
 
-# --- 5. PENDING BET RETRIEVAL & FULL SEASON POST-MORTEM HISTORY ---
-def get_pending_nfl_bets(sheet):
+# --- 5. PENDING BET RETRIEVAL CACHED DATA ---
+def get_pending_nfl_bets(rows):
     try:
-        rows = sheet.get_all_values()
         if len(rows) <= 1: return [], []
-        
         headers = [h.strip() for h in rows[0]]
         status_idx = headers.index("Status")
         game_idx = headers.index("Game")
@@ -302,10 +292,8 @@ def get_pending_nfl_bets(sheet):
         print(f"Notice retrieving pending NFL bets: {e}")
         return [], []
 
-def get_full_bet_history(sheet):
-    """Pulls the entire season of settled bets with untruncated reasoning, bet type, odds, and sources."""
+def get_full_bet_history(rows):
     try:
-        rows = sheet.get_all_values()
         if len(rows) <= 1: return []
         headers = [h.strip() for h in rows[0]]
         status_idx = headers.index("Status")
@@ -356,7 +344,6 @@ def scrape_nfl_sites():
     return scraped_text
 
 def fetch_nfl_odds(odds_key):
-    """Fetches odds and strictly excludes games that have already kicked off or start within 15 minutes."""
     url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds/?apiKey={odds_key}&regions=us&markets=h2h,spreads,totals&bookmakers=draftkings,fanduel,betmgm,williamhill_us&oddsFormat=american"
     resp = requests.get(url)
     if resp.status_code != 200:
@@ -372,11 +359,9 @@ def fetch_nfl_odds(odds_key):
             continue
         try:
             kickoff_dt = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
-            # Skip games that already started or start in under 15 minutes
             if kickoff_dt <= (now_utc + timedelta(minutes=15)):
                 continue
             
-            # Explicitly store US Eastern Time calendar date
             dt_et = kickoff_dt.astimezone(ZoneInfo("America/New_York"))
             game["game_date_et"] = dt_et.strftime("%Y-%m-%d")
             valid_upcoming_games.append(game)
@@ -386,10 +371,6 @@ def fetch_nfl_odds(odds_key):
     return valid_upcoming_games
 
 def calculate_true_ev(odds_val, model_prob_pct):
-    """
-    Calculates exact Implied Probability (%) and Expected Value (%) in Python
-    so Gemini cannot hallucinate or fudge the math.
-    """
     if odds_val < 0:
         implied_prob = abs(odds_val) / (abs(odds_val) + 100.0)
         decimal_profit = 100.0 / abs(odds_val)
@@ -439,7 +420,7 @@ def verify_pending_lines_deterministically(sheet, upcoming_bets, live_odds):
                 break
 
         if not matched_game:
-            surviving_bets.append(bet)
+            # Game has kicked off or vanished. Leave pending in sheet, skip re-evaluation.
             continue
 
         book_data = next((b for b in matched_game.get("bookmakers", []) if b.get("key") == target_book), None)
@@ -480,13 +461,12 @@ def verify_pending_lines_deterministically(sheet, upcoming_bets, live_odds):
 
         surviving_bets.append(bet)
 
-    return surviving_bets
+    return surviving_bets, rejected_count
 
-# --- 7. AI EVALUATION & GENERATION (ACTIVE LEARNING + ANTI-HALLUCINATION) ---
-def evaluate_and_generate_nfl(scraped_data, odds_data, upcoming_bets, memory, slots_to_fill, sheet):
+# --- 7. AI EVALUATION & GENERATION ---
+def evaluate_and_generate_nfl(scraped_data, odds_data, upcoming_bets, memory, slots_to_fill, full_history):
     api_key = os.environ.get("GEMINI_API_KEY")
     client = genai.Client(api_key=api_key)
-    full_history = get_full_bet_history(sheet)
 
     prompt = f"""
     You are an elite, conservative NFL quantitative analyst. Your objective is to identify genuine market inefficiencies across Spreads, Game Totals (Over/Under), and Moneylines.
@@ -561,16 +541,23 @@ def main():
     if odds_key:
         auto_grade_nfl_bets(sheet, odds_key)
 
+    # FETCH ONCE: Drastically reduces Google Sheets API calls to prevent rate limit silent failures
+    try:
+        rows = sheet.get_all_values()
+    except Exception as e:
+        print(f"CRITICAL: Failed to fetch sheet data. Exiting to prevent duplicates. Error: {e}")
+        return
+
     update_scoreboard(spreadsheet)
 
     memory = load_nfl_memory()
-    updated_memory = update_nfl_memory_from_sheet(sheet, memory)
+    updated_memory = update_nfl_memory_from_sheet(rows, memory)
     current_time_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S EDT")
     today_date_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
-    upcoming_bets, all_pending = get_pending_nfl_bets(sheet)
+    upcoming_bets, all_pending = get_pending_nfl_bets(rows)
+    full_history = get_full_bet_history(rows)
     
-    # Track existing games (either home/away ordering) to prevent duplicates
     active_game_tokens = set()
     for p in all_pending:
         tokens = tuple(sorted([t for t in p["game"].lower().split() if len(t) > 3]))
@@ -586,20 +573,18 @@ def main():
         update_nfl_evolution_log(spreadsheet, updated_memory, current_time_str)
         return
 
-    upcoming_bets = verify_pending_lines_deterministically(sheet, upcoming_bets, live_odds)
-    slots_to_fill = max(0, 5 - len([b for b in all_pending if b["row_index"] in [u["row_index"] for u in upcoming_bets]]))
+    upcoming_bets, rejected_count = verify_pending_lines_deterministically(sheet, upcoming_bets, live_odds)
+    slots_to_fill = max(0, 5 - (len(all_pending) - rejected_count))
     print(f"Open Slots to Fill: {slots_to_fill}")
 
-    result = evaluate_and_generate_nfl(scraped_text, live_odds, upcoming_bets, updated_memory, slots_to_fill, sheet)
+    result = evaluate_and_generate_nfl(scraped_text, live_odds, upcoming_bets, updated_memory, slots_to_fill, full_history)
 
-    # Save Gemini's active post-mortem learning into memory and the Evolution tab
     new_learning = result.get("strategy_adjustment")
     if new_learning:
         updated_memory["learnings_and_adjustments"] = new_learning
         with open("nfl_bot_memory.json", "w") as f:
             json.dump(updated_memory, f, indent=2)
 
-    # 1. Process Validations
     validations = result.get("validations", [])
     for v in validations:
         row_idx = v.get("row_index")
@@ -611,9 +596,8 @@ def main():
                 sheet.update_cell(row_idx, 11, "REJECTED")
                 slots_to_fill += 1
 
-    # 2. Append New Picks (With Deterministic Python EV Calculation & Hard Floor)
-    MIN_EV_THRESHOLD = 4.0  # Realistic, un-inflated NFL EV floor (4.0%+)
-    MAX_PROB_EDGE = 6.0     # Cap model probability at +6.0% over implied prob to prevent LLM exaggeration
+    MIN_EV_THRESHOLD = 4.0
+    MAX_PROB_EDGE = 6.0
 
     new_picks = result.get("new_picks", [])
     added = 0
@@ -627,35 +611,24 @@ def main():
         if pick_tokens in active_game_tokens:
             continue
             
-        try:
-            odds_val = float(p.get("odds", -110))
-        except (ValueError, TypeError):
-            odds_val = -110.0
+        try: odds_val = float(p.get("odds", -110))
+        except (ValueError, TypeError): odds_val = -110.0
 
         if "moneyline" in p.get("bet_type", "").lower() and odds_val < -120:
             continue
 
-        # Parse Gemini's model probability
         raw_prob = str(p.get("model_prob_num", p.get("model_prob", "0"))).replace("%", "").strip()
-        try:
-            model_prob_val = float(raw_prob)
-        except ValueError:
-            continue
+        try: model_prob_val = float(raw_prob)
+        except ValueError: continue
 
-        # Calculate initial implied probability
         implied_prob_val, _ = calculate_true_ev(odds_val, model_prob_val)
 
-        # Guardrail: Clamp realistic probability edge so Gemini cannot invent 15% edges
         if (model_prob_val - implied_prob_val) > MAX_PROB_EDGE:
-            print(f"Clamping exaggerated model_prob ({model_prob_val}%) on {p.get('pick')}")
             model_prob_val = round(implied_prob_val + MAX_PROB_EDGE, 2)
 
-        # Deterministically compute final Implied Prob and EV in Python
         implied_prob_val, ev_val = calculate_true_ev(odds_val, model_prob_val)
 
-        # Hard EV Gate: Skip any bet that does not clear the mathematical floor
         if ev_val < MIN_EV_THRESHOLD:
-            print(f"Skipping {p.get('pick')}: True EV ({ev_val}%) is below {MIN_EV_THRESHOLD}% minimum.")
             continue
 
         sheet.append_row([

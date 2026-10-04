@@ -68,7 +68,7 @@ def update_scoreboard(spreadsheet):
     except Exception as e:
         print(f"Notice updating Scoreboard: {e}")
 
-# --- 3. THE ODDS API AUTO-GRADER ---
+# --- 3. THE ODDS API AUTO-GRADER (3-DAY LOOKBACK & DUAL-DATE MATCHING) ---
 def auto_grade_nfl_bets(sheet, odds_key):
     try:
         rows = sheet.get_all_values()
@@ -220,7 +220,7 @@ def update_nfl_evolution_log(spreadsheet, memory, current_time_str):
             memory.get("total_bets", 0),
             memory.get("win_rate", "0%"),
             memory.get("net_profit_dollars", 0.0),
-            memory.get("learnings_and_adjustments", "Evaluate best overall EV; enforce kickoff cutoff & -120 juice ceiling.")
+            memory.get("learnings_and_adjustments", "Filter expert consensus through historical trend winners, shopping lines across DK, FD, MGM, Caesars.")
         ])
     except Exception as e:
         pass
@@ -232,7 +232,7 @@ def load_nfl_memory():
         except Exception: pass
     default_memory = {
         "total_bets": 0, "wins": 0, "losses": 0, "win_rate": "0%", "net_profit_dollars": 0.0,
-        "learnings_and_adjustments": "Evaluate best overall EV; enforce kickoff cutoff & -120 juice ceiling."
+        "learnings_and_adjustments": "Filter expert consensus through historical trend winners, shopping lines across DK, FD, MGM, Caesars."
     }
     with open("nfl_bot_memory.json", "w") as f: json.dump(default_memory, f, indent=2)
     return default_memory
@@ -256,7 +256,7 @@ def update_nfl_memory_from_sheet(rows, memory):
         pass
     return memory
 
-# --- 5. PENDING BET RETRIEVAL CACHED DATA ---
+# --- 5. PENDING BET RETRIEVAL & HISTORICAL AUDIT ---
 def get_pending_nfl_bets(rows):
     try:
         if len(rows) <= 1: return [], []
@@ -420,7 +420,6 @@ def verify_pending_lines_deterministically(sheet, upcoming_bets, live_odds):
                 break
 
         if not matched_game:
-            # Game has kicked off or vanished. Leave pending in sheet, skip re-evaluation.
             continue
 
         book_data = next((b for b in matched_game.get("bookmakers", []) if b.get("key") == target_book), None)
@@ -463,26 +462,35 @@ def verify_pending_lines_deterministically(sheet, upcoming_bets, live_odds):
 
     return surviving_bets, rejected_count
 
-# --- 7. AI EVALUATION & GENERATION ---
+# --- 7. AI EVALUATION (HISTORICAL TRENDS -> CONSENSUS -> ODDS -> SELECTION) ---
 def evaluate_and_generate_nfl(scraped_data, odds_data, upcoming_bets, memory, slots_to_fill, full_history):
     api_key = os.environ.get("GEMINI_API_KEY")
     client = genai.Client(api_key=api_key)
 
     prompt = f"""
-    You are an elite, conservative NFL quantitative analyst. Your objective is to identify genuine market inefficiencies across Spreads, Game Totals (Over/Under), and Moneylines.
+    You are an elite NFL quantitative analyst. Your task is to build the most mathematically optimal betting card by strictly following a 4-step workflow.
 
-    CRITICAL ANTI-HALLUCINATION & LEARNING RULES:
-    - Do NOT invent or inflate 'model_prob_num' just to fill slots. It is 100% acceptable to return 0, 1, or 2 picks if the board lacks value.
-    - NFL markets are highly efficient. A realistic edge on a strong play is ONLY 2.5% to 5.5% above the sportsbook's implied probability (e.g., 55.0% to 57.5% on a -110 bet).
-    - AUDIT YOUR PAST REASONING: Carefully review the FULL SEASON SETTLED BET HISTORY below. Identify which specific rationales, bet types, or consensus sources led to LOSSES versus WINS, and actively penalize setups that failed previously.
-    - You may ONLY project a win probability above the book's implied probability if you can cite EITHER:
-      (a) A concrete cross-book line/juice discrepancy in the LIVE SPORTSBOOK ODDS below (e.g., Book A is -2.5 at -110 while Books B & C are -3.0 or -120), OR
-      (b) Strong, explicit alignment from the scraped expert consensus.
+    WORKFLOW HIERARCHY:
+    1. HISTORICAL TREND CALIBRATION (STEP 1):
+       Analyze the FULL SEASON SETTLED BET HISTORY to determine your baseline rules. Identify which setups actually predict wins (e.g., sharp QB efficiency, under-the-key-number favorites) and which setups fail (e.g., forcing totals, backing bad offenses on hooks).
+       
+    2. EXPERT CONSENSUS (STEP 2):
+       Analyze the scraped expert text (Pickwatch, Action Network, VegasInsider, BettingPros, Sharp Football Analysis). Identify teams and totals with strong, explicit sharp alignment that survive your historical trend filter. Reject any sharp consensus that mimics your past historical losses.
+
+    3. BEST LIVE MARKET PRICE (STEP 3):
+       Once a consensus-backed play passes your trend filter, scan the LIVE SPORTSBOOK ODDS to find the single best line and price across DraftKings, FanDuel, BetMGM, and Caesars.
+
+    4. FINAL SELECTION (STEP 4):
+       Calculate the true edge. You have up to {slots_to_fill} open slots. ONLY output plays that successfully pass Steps 1, 2, and 3. Return [] if the board lacks quality edges.
+
+    CRITICAL CONSTRAINTS:
+    - Realistic Edges: Model probability must stay strictly within 2.5% to 5.5% above implied probability.
+    - Juice Ceiling: No Moneyline favorite steeper than -120.
 
     === HISTORICAL RECORD & PERFORMANCE ===
     {json.dumps(memory, indent=2)}
 
-    === FULL SEASON SETTLED BET HISTORY & PERFORMANCE ===
+    === FULL SEASON SETTLED BET HISTORY ===
     {json.dumps(full_history, indent=2)}
 
     === ACTIVE UPCOMING PICKS TO RE-EVALUATE ===
@@ -494,15 +502,9 @@ def evaluate_and_generate_nfl(scraped_data, odds_data, upcoming_bets, memory, sl
     === LIVE SPORTSBOOK ODDS (ALL FUTURE KICKOFFS) ===
     {json.dumps(odds_data[:14], indent=2)}
 
-    MANDATES:
-    1. SELECT ONLY FROM THE LIVE ODDS PROVIDED: Every new pick MUST match an exact bookmaker line and price in the LIVE SPORTSBOOK ODDS section.
-    2. USE THE game_date_et FIELD: Use 'game_date_et' as your 'date' field.
-    3. JUICE CEILING: No Moneyline favorite steeper than -120.
-    4. QUALITY OVER QUANTITY: You have up to {slots_to_fill} open slots, but ONLY output plays with a verifiable pricing discrepancy or sharp consensus edge. Return an empty list [] if no true edges exist.
-
     RETURN STRICT JSON ONLY (Python will calculate Implied Prob and EV):
     {{
-      "strategy_adjustment": "1-2 sentences summarizing specific lessons learned from settled WIN/LOSS reasoning patterns and how you are calibrating Model Prob today.",
+      "strategy_adjustment": "1-2 sentences summarizing which historical trends you identified in Step 1, and how they filtered the expert consensus in Step 2.",
       "validations": [
         {{ "row_index": <int>, "action": "VALIDATED" or "REJECTED", "note": "Reason" }}
       ],
@@ -515,8 +517,8 @@ def evaluate_and_generate_nfl(scraped_data, odds_data, upcoming_bets, memory, sl
           "odds": -110,
           "model_prob_num": 55.8,
           "units": 1.0,
-          "reasoning": "Cite the exact cross-book odds discrepancy, matchup factor, and how this aligns with historical lessons.",
-          "high_agreement": "Source consensus breakdown"
+          "reasoning": "Explain how this pick satisfies Step 1 (Historical Trend) and Step 3 (Pricing Edge).",
+          "high_agreement": "Detail the specific expert consensus (Step 2) backing this play."
         }}
       ]
     }}
@@ -541,7 +543,7 @@ def main():
     if odds_key:
         auto_grade_nfl_bets(sheet, odds_key)
 
-    # FETCH ONCE: Drastically reduces Google Sheets API calls to prevent rate limit silent failures
+    # Single sheet read to eliminate rate-limit silent failures
     try:
         rows = sheet.get_all_values()
     except Exception as e:

@@ -27,7 +27,7 @@ def get_nfl_sheets():
     try:
         sheet = spreadsheet.worksheet("NFL")
     except Exception:
-        sheet = spreadsheet.add_worksheet(title="NFL", rows=200, cols=16)
+        sheet = spreadsheet.add_worksheet(title="NFL", rows=200, cols=17)
     return spreadsheet, sheet
 
 def ensure_nfl_headers(sheet):
@@ -36,12 +36,22 @@ def ensure_nfl_headers(sheet):
         headers = [
             "Date", "Pulled Time", "Game", "Bet Type / Sportsbook", "Pick", "Odds", 
             "Implied Prob (%)", "Model Prob (%)", "EV (%)", "Units", 
-            "Status", "P/L ($)", "Reasoning", "Validation", "High Agreement & Source Breakdown"
+            "Locked", "Status", "P/L ($)", "Reasoning", "Validation", "High Agreement & Source Breakdown"
         ]
+        
+        # Insert headers if sheet is empty
         if not existing_rows or not existing_rows[0] or len(existing_rows[0]) == 0 or "date" not in str(existing_rows[0][0]).lower():
             sheet.insert_row(headers, index=1)
-            sheet.format("A1:O1", {"textFormat": {"bold": True}})
+            sheet.format("A1:P1", {"textFormat": {"bold": True}})
             sheet.freeze(rows=1)
+            return
+
+        # Check if the Locked column exists, if not, we need to add it manually or instruct the user.
+        # For safety on live sheets, we rely on fuzzy matching to find it.
+        h_lower = [str(h).strip().lower() for h in existing_rows[0]]
+        if "locked" not in h_lower:
+             print("NOTICE: 'Locked' column not found in headers. Please add a column titled 'Locked' before 'Status' to use the lock feature.")
+             
     except Exception as e:
         print(f"Notice while checking NFL headers: {e}")
 
@@ -55,8 +65,8 @@ def update_scoreboard(spreadsheet):
 
         scoreboard_data = [
             ["Bot / Sport", "Correct Picks (Wins)", "Incorrect Picks (Losses)", "Pending Bets", "Win Rate (%)", "Total Money Won / Lost ($)"],
-            ["MLB Bot", '=COUNTIF(MLB!K:K, "WIN")', '=COUNTIF(MLB!K:K, "LOSS")', '=COUNTIF(MLB!K:K, "PENDING")', '=IFERROR(B2/(B2+C2), 0)', '=SUM(MLB!L:L)'],
-            ["NFL Bot", '=COUNTIF(NFL!K:K, "WIN")', '=COUNTIF(NFL!K:K, "LOSS")', '=COUNTIF(NFL!K:K, "PENDING")', '=IFERROR(B3/(B3+C3), 0)', '=SUM(NFL!L:L)'],
+            ["MLB Bot", '=COUNTIF(MLB!L:L, "WIN")', '=COUNTIF(MLB!L:L, "LOSS")', '=COUNTIF(MLB!L:L, "PENDING")', '=IFERROR(B2/(B2+C2), 0)', '=SUM(MLB!M:M)'],
+            ["NFL Bot", '=COUNTIF(NFL!L:L, "WIN")', '=COUNTIF(NFL!L:L, "LOSS")', '=COUNTIF(NFL!L:L, "PENDING")', '=IFERROR(B3/(B3+C3), 0)', '=SUM(NFL!M:M)'],
             ["Total Overall", '=B2+B3', '=C2+C3', '=D2+D3', '=IFERROR(B4/(B4+C4), 0)', '=F2+F3']
         ]
 
@@ -72,16 +82,17 @@ def get_column_indices(headers):
     """Safely finds column indexes regardless of slight formatting differences."""
     h_lower = [str(h).strip().lower() for h in headers]
     return {
-        "status": h_lower.index("status") if "status" in h_lower else 10,
+        "status": h_lower.index("status") if "status" in h_lower else 11,
+        "locked": h_lower.index("locked") if "locked" in h_lower else 10,
         "game": h_lower.index("game") if "game" in h_lower else 2,
         "bet_type": next((i for i, x in enumerate(h_lower) if "bet type" in x or "sportsbook" in x), 3),
         "pick": h_lower.index("pick") if "pick" in h_lower else 4,
         "odds": h_lower.index("odds") if "odds" in h_lower else 5,
         "units": h_lower.index("units") if "units" in h_lower else 9,
-        "pl": next((i for i, x in enumerate(h_lower) if "p/l" in x or "profit" in x), 11),
-        "reasoning": h_lower.index("reasoning") if "reasoning" in h_lower else 12,
-        "validation": h_lower.index("validation") if "validation" in h_lower else 13,
-        "sources": next((i for i, x in enumerate(h_lower) if "agreement" in x or "source" in x), 14)
+        "pl": next((i for i, x in enumerate(h_lower) if "p/l" in x or "profit" in x), 12),
+        "reasoning": h_lower.index("reasoning") if "reasoning" in h_lower else 13,
+        "validation": h_lower.index("validation") if "validation" in h_lower else 14,
+        "sources": next((i for i, x in enumerate(h_lower) if "agreement" in x or "source" in x), 15)
     }
 
 # --- 4. THE ODDS API AUTO-GRADER ---
@@ -170,7 +181,6 @@ def auto_grade_nfl_bets(sheet, odds_key, rows):
                 elif status == "LOSS": profit = -100.0 * units
                 elif status == "PUSH": profit = 0.0
 
-                # Determine correct column letters based on indices
                 col_k_letter = chr(65 + cols["status"])
                 col_l_letter = chr(65 + cols["pl"])
                 updates.append({"range": f"{col_k_letter}{row_idx}:{col_l_letter}{row_idx}", "values": [[status, round(profit, 2)]]})
@@ -191,6 +201,13 @@ def get_pending_nfl_bets(rows):
     pending_bets = []
     for idx, r in enumerate(rows[1:], start=2):
         if len(r) > cols["status"] and str(r[cols["status"]]).strip().upper() == "PENDING":
+            is_locked = False
+            # Check the locked column if it exists in the row
+            if len(r) > cols["locked"]:
+                 locked_val = str(r[cols["locked"]]).strip().upper()
+                 if locked_val in ["YES", "Y", "TRUE", "LOCKED"]:
+                     is_locked = True
+                     
             pending_bets.append({
                 "row_index": idx,
                 "date": str(r[0]).strip(),
@@ -198,6 +215,7 @@ def get_pending_nfl_bets(rows):
                 "bet_type": r[cols["bet_type"]].strip() if len(r) > cols["bet_type"] else "",
                 "pick": r[cols["pick"]].strip() if len(r) > cols["pick"] else "",
                 "odds": r[cols["odds"]].strip() if len(r) > cols["odds"] else "-110",
+                "is_locked": is_locked,
                 "col_status": cols["status"],
                 "col_val": cols["validation"]
             })
@@ -275,6 +293,62 @@ def parse_json_from_response(response):
         try: return json.loads(json_match.group(0))
         except: pass
     return {}
+    
+def update_nfl_evolution_log(spreadsheet, memory, current_time_str):
+    try:
+        try:
+            evo_sheet = spreadsheet.worksheet("NFL Evolution & Learnings")
+        except Exception:
+            evo_sheet = spreadsheet.add_worksheet(title="NFL Evolution & Learnings", rows=100, cols=8)
+
+        existing_rows = evo_sheet.get_all_values()
+        headers = ["Timestamp", "Sport", "Total Bets Evaluated", "Win Rate (%)", "Net Profit ($)", "Active Strategy Adjustment"]
+
+        if not existing_rows or not existing_rows[0] or len(existing_rows[0]) == 0 or existing_rows[0][0] != "Timestamp":
+            evo_sheet.insert_row(headers, index=1)
+            evo_sheet.format("A1:F1", {"textFormat": {"bold": True}})
+            evo_sheet.freeze(rows=1)
+
+        evo_sheet.append_row([
+            current_time_str,
+            "NFL Consensus",
+            memory.get("total_bets", 0),
+            memory.get("win_rate", "0%"),
+            memory.get("net_profit_dollars", 0.0),
+            memory.get("learnings_and_adjustments", "Filter expert consensus through historical trend winners, shopping lines across DK, FD, MGM, Caesars.")
+        ])
+    except Exception as e:
+        pass
+
+def load_nfl_memory():
+    if os.path.exists("nfl_bot_memory.json"):
+        try:
+            with open("nfl_bot_memory.json", "r") as f: return json.load(f)
+        except Exception: pass
+    default_memory = {
+        "total_bets": 0, "wins": 0, "losses": 0, "win_rate": "0%", "net_profit_dollars": 0.0,
+        "learnings_and_adjustments": "Filter expert consensus through historical trend winners, shopping lines across DK, FD, MGM, Caesars."
+    }
+    with open("nfl_bot_memory.json", "w") as f: json.dump(default_memory, f, indent=2)
+    return default_memory
+
+def update_nfl_memory_from_sheet(rows, memory):
+    try:
+        if len(rows) <= 1: return memory
+        cols = get_column_indices(rows[0])
+        wins = sum(1 for r in rows[1:] if len(r) > cols["status"] and str(r[cols["status"]]).strip().upper() == "WIN")
+        losses = sum(1 for r in rows[1:] if len(r) > cols["status"] and str(r[cols["status"]]).strip().upper() == "LOSS")
+        total = wins + losses
+        if total > 0:
+            memory["total_bets"] = total
+            memory["wins"] = wins
+            memory["losses"] = losses
+            memory["win_rate"] = f"{round((wins / total) * 100, 1)}%"
+            memory["net_profit_dollars"] = round(sum(float(r[cols["pl"]] or 0.0) for r in rows[1:] if len(r) > cols["pl"] and r[cols["pl"]]), 2)
+        with open("nfl_bot_memory.json", "w") as f: json.dump(memory, f, indent=2)
+    except Exception as e:
+        pass
+    return memory
 
 # --- 7. PHASE 1: EVALUATE & PRUNE WITH BATCH UPDATES ---
 def reevaluate_open_bets(sheet, upcoming_bets, live_odds, scraped_text, full_history):
@@ -287,6 +361,14 @@ def reevaluate_open_bets(sheet, upcoming_bets, live_odds, scraped_text, full_his
     for bet in upcoming_bets:
         row_idx, col_status, col_val = bet["row_index"], bet["col_status"], bet["col_val"]
         stat_let, val_let = chr(65 + col_status), chr(65 + col_val)
+        
+        # --- LOCKED BET BYPASS ---
+        if bet.get("is_locked"):
+             print(f"Row {row_idx}: Bet is LOCKED. Bypassing evaluation and retaining.")
+             batch_updates.append({"range": f"{val_let}{row_idx}", "values": [["VALIDATED"]]})
+             surviving_after_python.append(bet)
+             continue
+        
         target_book = "draftkings" if "draftkings" in bet["bet_type"].lower() else "fanduel" if "fanduel" in bet["bet_type"].lower() else "betmgm" if "betmgm" in bet["bet_type"].lower() else "williamhill_us"
         
         matched_game = next((g for g in live_odds if are_games_equal(bet["game"], f"{g.get('away_team')} @ {g.get('home_team')}")), None)
@@ -318,16 +400,26 @@ def reevaluate_open_bets(sheet, upcoming_bets, live_odds, scraped_text, full_his
         if batch_updates: sheet.batch_update(batch_updates)
         return []
 
-    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-    eval_prompt = f"You are an NFL quant re-evaluating bets.\n=== HISTORY ===\n{json.dumps(full_history[:5], indent=2)}\n=== BETS ===\n{json.dumps(surviving_after_python, indent=2)}\nEvaluate against consensus. Return strictly: {{\"validations\": [{{\"row_index\": <int>, \"action\": \"VALIDATED\" or \"REJECTED\"}}]}}"
+    # Send only the UNLOCKED bets to Gemini for qualitative evaluation
+    unlocked_surviving = [b for b in surviving_after_python if not b.get("is_locked")]
     
-    try:
-        response = client.models.generate_content(model="gemini-3.1-pro-preview", contents=eval_prompt)
-        val_map = {v["row_index"]: v["action"].upper() for v in parse_json_from_response(response).get("validations", []) if "row_index" in v}
-    except: val_map = {}
+    val_map = {}
+    if unlocked_surviving:
+        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        eval_prompt = f"You are an NFL quant re-evaluating bets.\n=== HISTORY ===\n{json.dumps(full_history[:5], indent=2)}\n=== BETS ===\n{json.dumps(unlocked_surviving, indent=2)}\nEvaluate against consensus. Return strictly: {{\"validations\": [{{\"row_index\": <int>, \"action\": \"VALIDATED\" or \"REJECTED\"}}]}}"
+        
+        try:
+            response = client.models.generate_content(model="gemini-3.1-pro-preview", contents=eval_prompt)
+            val_map = {v["row_index"]: v["action"].upper() for v in parse_json_from_response(response).get("validations", []) if "row_index" in v}
+        except: val_map = {}
 
     final_surviving = []
     for bet in surviving_after_python:
+        # If it was locked, we already appended it above and set batch_update, so just keep it.
+        if bet.get("is_locked"):
+             final_surviving.append(bet)
+             continue
+             
         r_idx, stat_let, val_let = bet["row_index"], chr(65 + bet["col_status"]), chr(65 + bet["col_val"])
         if val_map.get(r_idx, "VALIDATED") == "REJECTED":
             batch_updates.append({"range": f"{stat_let}{r_idx}", "values": [["REJECTED"]]})
@@ -338,7 +430,7 @@ def reevaluate_open_bets(sheet, upcoming_bets, live_odds, scraped_text, full_his
 
     if batch_updates:
         sheet.batch_update(batch_updates)
-        print("Column N (Validation) updated successfully.")
+        print("Column Status and Validation updated successfully.")
         
     return final_surviving
 
@@ -430,7 +522,7 @@ def main():
 
         sheet.append_row([
             p.get("date", today_date_str), current_time_str, game_name, p.get("bet_type", ""), p.get("pick", ""), odds_val,
-            f"{implied}%", f"{model_prob_val}%", f"{ev_val}%", p.get("units", 1.0), "PENDING", 0.0, p.get("reasoning", ""), "NEW", p.get("high_agreement", "")
+            f"{implied}%", f"{model_prob_val}%", f"{ev_val}%", p.get("units", 1.0), "", "PENDING", 0.0, p.get("reasoning", ""), "NEW", p.get("high_agreement", "")
         ], value_input_option="USER_ENTERED")
         surviving_bets.append({"game": game_name})
         added += 1

@@ -39,15 +39,12 @@ def ensure_nfl_headers(sheet):
             "Locked", "Status", "P/L ($)", "Reasoning", "Validation", "High Agreement & Source Breakdown"
         ]
         
-        # Insert headers if sheet is empty
         if not existing_rows or not existing_rows[0] or len(existing_rows[0]) == 0 or "date" not in str(existing_rows[0][0]).lower():
             sheet.insert_row(headers, index=1)
             sheet.format("A1:P1", {"textFormat": {"bold": True}})
             sheet.freeze(rows=1)
             return
 
-        # Check if the Locked column exists, if not, we need to add it manually or instruct the user.
-        # For safety on live sheets, we rely on fuzzy matching to find it.
         h_lower = [str(h).strip().lower() for h in existing_rows[0]]
         if "locked" not in h_lower:
              print("NOTICE: 'Locked' column not found in headers. Please add a column titled 'Locked' before 'Status' to use the lock feature.")
@@ -106,7 +103,8 @@ def auto_grade_nfl_bets(sheet, odds_key, rows):
         if not pending_rows:
             return 0
 
-        scores_url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores/?apiKey={odds_key}&daysFrom=3"
+        # FIX 1: Lookback extended to 10 days to catch older locked picks
+        scores_url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores/?apiKey={odds_key}&daysFrom=10"
         resp = requests.get(scores_url)
         if resp.status_code != 200: return 0
 
@@ -202,7 +200,6 @@ def get_pending_nfl_bets(rows):
     for idx, r in enumerate(rows[1:], start=2):
         if len(r) > cols["status"] and str(r[cols["status"]]).strip().upper() == "PENDING":
             is_locked = False
-            # Check the locked column if it exists in the row
             if len(r) > cols["locked"]:
                  locked_val = str(r[cols["locked"]]).strip().upper()
                  if locked_val in ["YES", "Y", "TRUE", "LOCKED"]:
@@ -245,7 +242,7 @@ def are_games_equal(game1, game2):
     t2 = {w for w in re.sub(r'[@\-_vs\.]', ' ', game2.lower()).split() if len(w) > 2 and w not in stop_words}
     return len(t1.intersection(t2)) >= 2
 
-# --- 6. SCRAPING, ODDS & MATH (Omitted unmodified helpers for brevity) ---
+# --- 6. SCRAPING, ODDS & MATH ---
 def scrape_nfl_sites():
     sites = [("NFL Pickwatch", "https://nflpickwatch.com/"), ("Action Network NFL", "https://www.actionnetwork.com/nfl/picks"), ("VegasInsider NFL", "https://www.vegasinsider.com/nfl/odds/las-vegas/")]
     scraped_text = ""
@@ -400,7 +397,6 @@ def reevaluate_open_bets(sheet, upcoming_bets, live_odds, scraped_text, full_his
         if batch_updates: sheet.batch_update(batch_updates)
         return []
 
-    # Send only the UNLOCKED bets to Gemini for qualitative evaluation
     unlocked_surviving = [b for b in surviving_after_python if not b.get("is_locked")]
     
     val_map = {}
@@ -415,7 +411,6 @@ def reevaluate_open_bets(sheet, upcoming_bets, live_odds, scraped_text, full_his
 
     final_surviving = []
     for bet in surviving_after_python:
-        # If it was locked, we already appended it above and set batch_update, so just keep it.
         if bet.get("is_locked"):
              final_surviving.append(bet)
              continue
@@ -455,7 +450,17 @@ def generate_additional_picks(scraped_text, live_odds, surviving_bets, slots_to_
     {{
       "strategy_adjustment": "1-2 sentences on filters used.",
       "new_picks": [
-        {{ "date": "YYYY-MM-DD", "game": "Away @ Home", "bet_type": "Spread (DraftKings)", "pick": "Team +X.X", "odds": -110, "model_prob_num": 55.8, "units": 1.0, "reasoning": "...", "high_agreement": "..." }}
+        {{ 
+          "date": "YYYY-MM-DD", 
+          "game": "Away @ Home", 
+          "bet_type": "Spread (DraftKings)", 
+          "pick": "Team +X.X", 
+          "odds": -110, 
+          "model_prob_num": 55.8, 
+          "units": 1.0, 
+          "reasoning": "...", 
+          "high_agreement": "Name the specific sites and analysts backing this play. DO NOT just write 'Yes'."
+        }}
       ]
     }}
     """

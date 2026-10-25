@@ -103,10 +103,14 @@ def auto_grade_nfl_bets(sheet, odds_key, rows):
         if not pending_rows:
             return 0
 
-        # FIX 1: Lookback extended to 10 days to catch older locked picks
-        scores_url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores/?apiKey={odds_key}&daysFrom=10"
+        print(f"Checking results for {len(pending_rows)} pending NFL bet(s) via The Odds API...")
+        
+        # Reverted to daysFrom=3 to prevent Odds API from rejecting the request
+        scores_url = f"https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores/?apiKey={odds_key}&daysFrom=3"
         resp = requests.get(scores_url)
-        if resp.status_code != 200: return 0
+        if resp.status_code != 200: 
+            print(f"Odds API Error {resp.status_code}: Could not fetch scores.")
+            return 0
 
         scores_data = resp.json()
         updates = []
@@ -175,17 +179,20 @@ def auto_grade_nfl_bets(sheet, odds_key, rows):
                     winner = home_team if home_score > away_score else away_team
                     status = "WIN" if any(t in pick_lower for t in winner.split() if len(t) > 3) else "LOSS"
 
-                if status == "WIN": profit = (100 / abs(odds)) * 100 * units if odds < 0 else (odds / 100) * 100 * units
-                elif status == "LOSS": profit = -100.0 * units
-                elif status == "PUSH": profit = 0.0
+                if status:
+                    if status == "WIN": profit = (100 / abs(odds)) * 100 * units if odds < 0 else (odds / 100) * 100 * units
+                    elif status == "LOSS": profit = -100.0 * units
+                    elif status == "PUSH": profit = 0.0
 
-                col_k_letter = chr(65 + cols["status"])
-                col_l_letter = chr(65 + cols["pl"])
-                updates.append({"range": f"{col_k_letter}{row_idx}:{col_l_letter}{row_idx}", "values": [[status, round(profit, 2)]]})
+                    col_k_letter = chr(65 + cols["status"])
+                    col_l_letter = chr(65 + cols["pl"])
+                    updates.append({"range": f"{col_k_letter}{row_idx}:{col_l_letter}{row_idx}", "values": [[status, round(profit, 2)]]})
+                    print(f"Graded NFL Row {row_idx}: {game_title} -> {status} (${round(profit, 2)})")
                 break
 
         if updates:
             sheet.batch_update(updates)
+            print(f"Successfully auto-graded {len(updates)} completed NFL bet(s)!")
             return len(updates)
     except Exception as e:
         print(f"NFL Auto-grading notice: {e}")
@@ -359,7 +366,6 @@ def reevaluate_open_bets(sheet, upcoming_bets, live_odds, scraped_text, full_his
         row_idx, col_status, col_val = bet["row_index"], bet["col_status"], bet["col_val"]
         stat_let, val_let = chr(65 + col_status), chr(65 + col_val)
         
-        # --- LOCKED BET BYPASS ---
         if bet.get("is_locked"):
              print(f"Row {row_idx}: Bet is LOCKED. Bypassing evaluation and retaining.")
              batch_updates.append({"range": f"{val_let}{row_idx}", "values": [["VALIDATED"]]})
@@ -480,10 +486,11 @@ def main():
     except Exception as e: return print(f"CRITICAL: Failed to read sheet: {e}")
 
     odds_key = os.environ.get("ODDS_API_KEY")
-    if odds_key: auto_grade_nfl_bets(sheet, odds_key, rows)
-    
-    # Re-fetch rows in case grader changed statuses
-    rows = sheet.get_all_values()
+    if odds_key: 
+        auto_grade_nfl_bets(sheet, odds_key, rows)
+        # Re-fetch rows in case grader changed statuses
+        rows = sheet.get_all_values()
+        
     update_scoreboard(spreadsheet)
 
     upcoming_bets, all_pending = get_pending_nfl_bets(rows)
